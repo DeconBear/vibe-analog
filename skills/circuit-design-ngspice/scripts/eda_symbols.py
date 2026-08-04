@@ -58,6 +58,17 @@ _TARGET_PIN_IDS = {
     "positive": "PLUS", "negative": "MINUS",
 }
 
+# Native primitives placed from the bundled KiCad library (eda.symbol) keep
+# the internal pin ids (a/b), so their pin_map must translate the canonical
+# pin role onto the KiCad package pin number.  KiCad Device diodes/LEDs
+# number the cathode as pin 1 and the anode as pin 2.
+KICAD_LIBRARY_ROLE_PIN_NUMBERS = {
+    "terminal_1": "1",
+    "terminal_2": "2",
+    "anode": "2",
+    "cathode": "1",
+}
+
 _VIRTUOSO_CELLS = {
     "resistor": ("analogLib", "res"), "capacitor": ("analogLib", "cap"),
     "inductor": ("analogLib", "ind"), "diode": ("analogLib", "diode"),
@@ -236,6 +247,28 @@ def _default_binding(target: str, component: dict[str, Any]) -> dict[str, Any]:
     eda = component["eda"]
     subtype = str(eda["subtype"])
     pins = component.get("pins", [])
+    if target == "kicad":
+        eda_symbol = str(eda.get("symbol", "")).strip()
+        if eda_symbol:
+            library, separator, cell = eda_symbol.partition(":")
+            if not separator or not library.strip() or not cell.strip():
+                raise ValueError(f"eda.symbol must use the 'Library:Cell' form: {eda_symbol!r}")
+            # Pin ids of BLOCK-style components are the package pin numbers,
+            # which are exactly the target symbol pin numbers.  Native
+            # primitives (R/C/D placed from Device:* symbols) keep internal
+            # pin ids (a/b), so translate through the canonical pin role.
+            pin_map = {}
+            for pin in pins:
+                pin_id = str(pin.get("id", ""))
+                role = str((pin.get("eda") or {}).get("role", ""))
+                pin_map[pin_id] = KICAD_LIBRARY_ROLE_PIN_NUMBERS.get(role, pin_id)
+            return {
+                "library": library.strip(),
+                "cell": cell.strip(),
+                "view": "symbol",
+                "pin_map": pin_map,
+                "library_symbol": eda_symbol,
+            }
     if target == "virtuoso":
         library, cell = _VIRTUOSO_CELLS.get(subtype, ("ACTOVIQ", f"Block_{len(pins)}Pin"))
     else:

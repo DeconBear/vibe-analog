@@ -604,7 +604,7 @@ def assert_kicad_primitive_library(output: Path) -> None:
     _write_kicad(root, "Portable_Primitives", primitive_ir, primitive_map)
     report = validate_kicad_package(root / "kicad", primitive_ir, primitive_map)
     assert report["instances"] == len(components)
-    library = (root / "kicad" / "Vibe Analog_Standard.kicad_sym").read_text(encoding="utf-8")
+    library = (root / "kicad" / "Vibe_Analog_Standard.kicad_sym").read_text(encoding="utf-8")
     for cell in ("R", "C", "L", "Diode", "NMOS_4PIN", "NPN", "Voltage_Source", "Current_Source"):
         assert f'(symbol "{cell}"' in library, f"portable KiCad library is missing {cell}"
     schematic = (root / "kicad" / "Portable_Primitives.kicad_sch").read_text(encoding="utf-8")
@@ -870,7 +870,7 @@ def main() -> int:
     kicad_schematics = sorted((export_root / "kicad").glob("*.kicad_sch"))
     assert all(balanced(path.read_text(encoding="utf-8")) for path in kicad_schematics)
     kicad_text = "\n".join(path.read_text(encoding="utf-8") for path in kicad_schematics)
-    standard_symbols = export_root / "kicad" / "Vibe Analog_Standard.kicad_sym"
+    standard_symbols = export_root / "kicad" / "Vibe_Analog_Standard.kicad_sym"
     assert standard_symbols.is_file(), "KiCad export must ship the standard project-local symbol library"
     symbol_text = standard_symbols.read_text(encoding="utf-8")
     package_report = validate_kicad_package(export_root / "kicad", ir, json.loads(

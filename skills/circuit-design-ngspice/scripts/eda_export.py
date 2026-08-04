@@ -21,7 +21,14 @@ from typing import Any, Iterable
 
 from eda_kicad_validate import find_kicad_cli, validate_kicad_package, validate_kicad_xml_connectivity
 from eda_portable_validate import validate_altium_import_package, validate_orcad_edif, validate_virtuoso_package
-from eda_symbols import assign_refdes, binding_for, prepare_component, resolve_symbol_map
+from eda_symbols import (
+    KICAD_LIBRARY_ROLE_PIN_NUMBERS,
+    assign_refdes,
+    binding_for,
+    prepare_component,
+    resolve_symbol_map,
+)
+from kicad_lib_embed import symbol_definition_lines, symbol_pin_positions
 
 
 EDA_IR_SCHEMA = "actoviq.eda-ir.v1"
@@ -217,6 +224,19 @@ def _component_size(component: dict[str, Any]) -> tuple[float, float]:
         width, height = 70.0, 100.0
     else:
         width, height = 100.0, 50.0
+        pins = component.get("pins") or []
+        if len(pins) > 2 and str(component.get("type", "")).upper() not in {"M", "Q", "E"}:
+            # Generic multi-pin symbols (for example board-level X devices)
+            # place their pins on the left/right box edges like a BLOCK.  The
+            # default 50-unit height only separates two pins; grow the box so
+            # every side pin keeps its own grid row instead of collapsing onto
+            # one shared point.
+            side_counts: dict[str, int] = {}
+            for index, pin in enumerate(pins):
+                side = _pin_side(component, pin, index)
+                side_counts[side] = side_counts.get(side, 0) + 1
+            per_side = max(side_counts.values(), default=1)
+            height = max(height, (per_side + 1) * GRID)
     # KiCad's normal schematic connection grid is 50 mil (1.27 mm), which is
     # half of an Vibe Analog 20-unit grid step.  Grid-aligned symbol dimensions keep
     # both pin connection points and routed wire endpoints on that grid.
@@ -230,7 +250,10 @@ def _component_size(component: dict[str, Any]) -> tuple[float, float]:
 def _component_bounds(component: dict[str, Any]) -> dict[str, float]:
     position = component.get("position") or {}
     x, y = float(position.get("x", 0)), float(position.get("y", 0))
-    if component.get("type") == "BLOCK":
+    if component.get("type") == "BLOCK" or (
+        len(component.get("pins") or []) > 2
+        and str(component.get("type", "")).upper() not in {"M", "Q", "E"}
+    ):
         width, height = _component_size(component)
         return {"min_x": x - width / 2, "min_y": y - height / 2, "max_x": x + width / 2, "max_y": y + height / 2}
     pin_points = [_pin_position(component, pin, index) for index, pin in enumerate(component.get("pins") or [])]
@@ -267,7 +290,12 @@ def _pin_side(component: dict[str, Any], pin: dict[str, Any], index: int) -> str
 def _pin_position(component: dict[str, Any], pin: dict[str, Any], index: int) -> dict[str, float]:
     component_type = str(component.get("type", "")).upper()
     key = f"{pin.get('id', '')} {pin.get('name', '')}".lower()
-    if component_type == "BLOCK":
+    if component_type == "BLOCK" or (len(component.get("pins") or []) > 2 and component_type not in {"M", "Q", "E"}):
+        # Generic multi-pin devices (X subcircuits, connectors, ICs without a
+        # dedicated geometry) share the BLOCK side/order box layout.  Without
+        # this every pin past the first collapsed onto one point, which made
+        # distinct nets physically unrouteable and shorted them in any target
+        # export that trusted the coordinates.
         pins = component.get("pins") or []
         width, height = _component_size({**component, "rotation": 0})
         side = _pin_side(component, pin, index)
@@ -854,12 +882,12 @@ def _grid_unit_nodes(start: dict[str, Any], end: dict[str, Any]) -> list[tuple[f
     return result
 
 
-def _endpoint_escape(endpoint: dict[str, Any]) -> dict[str, float]:
+def _endpoint_escape(endpoint: dict[str, Any], length: float = 2 * GRID) -> dict[str, float]:
     egress = endpoint.get("_egress") or {"x": 0, "y": 0}
     step = GRID / 2
     return {
-        "x": round((float(endpoint["x"]) + float(egress.get("x", 0)) * 2 * GRID) / step) * step,
-        "y": round((float(endpoint["y"]) + float(egress.get("y", 0)) * 2 * GRID) / step) * step,
+        "x": round((float(endpoint["x"]) + float(egress.get("x", 0)) * length) / step) * step,
+        "y": round((float(endpoint["y"]) + float(egress.get("y", 0)) * length) / step) * step,
     }
 
 
@@ -1130,23 +1158,37 @@ def _grid_route_nets_independently(
     return None
 
 
-def _route_module(
+def _module_net_endpoints(
     module: dict[str, Any],
     components: list[dict[str, Any]],
-    *,
-    allow_global_fallback: bool = True,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, float]]]:
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    """Build the source net partition with absolute pin/port geometry."""
+
     ports = _port_positions(module, components)
     declared_by_id, ids_by_name = _declared_net_maps(module)
     endpoints_by_net: dict[str, list[dict[str, Any]]] = {}
     net_names: dict[str, str] = {}
     for component in components:
+        component_type = str(component.get("type", "")).upper()
+        side_layout = component_type == "BLOCK" or (
+            len(component.get("pins") or []) > 2 and component_type not in {"M", "Q", "E"}
+        )
+        side_egress = {
+            "left": {"x": -1, "y": 0}, "right": {"x": 1, "y": 0},
+            "top": {"x": 0, "y": -1}, "bottom": {"x": 0, "y": 1},
+        }
         for index, pin in enumerate(component.get("pins", [])):
             point = _pin_position(component, pin, index)
             position = component.get("position") or {}
             dx = point["x"] - float(position.get("x", 0))
             dy = point["y"] - float(position.get("y", 0))
-            egress = {"x": (1 if dx > 0 else -1) if abs(dx) >= abs(dy) else 0, "y": (1 if dy > 0 else -1) if abs(dy) > abs(dx) else 0}
+            if side_layout:
+                # Tall multi-pin boxes place pins along their side walls; the
+                # dominant-axis heuristic points far-from-centre pins along
+                # the wall and straight through their neighbours.
+                egress = dict(side_egress[_pin_side(component, pin, index)])
+            else:
+                egress = {"x": (1 if dx > 0 else -1) if abs(dx) >= abs(dy) else 0, "y": (1 if dy > 0 else -1) if abs(dy) > abs(dx) else 0}
             net_id = _endpoint_net_id(pin, ids_by_name)
             net_names[net_id] = str((declared_by_id.get(net_id) or {}).get("name") or pin.get("net") or net_id)
             endpoints_by_net.setdefault(net_id, []).append({
@@ -1164,6 +1206,198 @@ def _route_module(
         endpoints = sorted(endpoints, key=lambda item: (item["x"], item["y"], item.get("component_id", ""), item.get("port_id", "")))
         nets.append({"id": net_id, "name": net_names.get(net_id, net_id), "endpoints": endpoints})
     component_bounds = {str(component["id"]): _component_bounds(component) for component in components}
+    return nets, ports, component_bounds
+
+
+def _apply_library_symbol_pin_positions(nets: list[dict[str, Any]], components: list[dict[str, Any]]) -> None:
+    """Anchor label stubs at the real library symbol pin coordinates.
+
+    A component with ``eda.symbol`` exports the genuine KiCad symbol, whose
+    pins sit at the library's own positions rather than the generated
+    generic-box anchors.  Override those endpoints (position plus escape
+    direction from the symbol pin angle) so the exported stub wire touches
+    the real graphical pin.
+    """
+
+    overrides: dict[tuple[str, str], tuple[float, float, dict[str, int]]] = {}
+    for component in components:
+        eda = component.get("eda") or {}
+        eda_symbol = str(eda.get("symbol", "")).strip()
+        if not eda_symbol:
+            continue
+        library, _, cell = eda_symbol.partition(":")
+        pin_positions = symbol_pin_positions(library, cell)
+        position = component.get("position") or {}
+        base_x = _kicad_snap_internal(float(position.get("x", 0)))
+        base_y = _kicad_snap_internal(float(position.get("y", 0)))
+        rotation = int(round(float(component.get("rotation", 0)))) % 360
+        for pin in component.get("pins", []):
+            pin_id = str(pin.get("id", ""))
+            number = pin_id
+            if number not in pin_positions:
+                # Native primitives keep internal pin ids (a/b); translate
+                # through the canonical role onto the KiCad package pin.
+                role = str((pin.get("eda") or {}).get("role", ""))
+                number = KICAD_LIBRARY_ROLE_PIN_NUMBERS.get(role, number)
+            if number not in pin_positions:
+                raise ValueError(
+                    f"pin {pin_id!r} of component {component.get('id', '')} is not present in KiCad symbol {eda_symbol}"
+                )
+            x_mm, y_mm, angle = pin_positions[number]
+            dx, dy = _rotate_point(x_mm / MM_PER_UNIT, -y_mm / MM_PER_UNIT, rotation)
+            # KiCad pin angles point from the connection end into the symbol
+            # body, so the stub leaves the other way.
+            vector = {0: (-1, 0), 90: (0, 1), 180: (1, 0), 270: (0, -1)}[(int(round(angle / 90.0)) * 90) % 360]
+            egress_x, egress_y = _rotate_point(float(vector[0]), float(vector[1]), rotation)
+            overrides[(str(component.get("id", "")), pin_id)] = (
+                _kicad_snap_internal(base_x + dx),
+                _kicad_snap_internal(base_y + dy),
+                {"x": int(round(egress_x)), "y": int(round(egress_y))},
+            )
+    if not overrides:
+        return
+    for net in nets:
+        for endpoint in net.get("endpoints", []):
+            if endpoint.get("kind") != "pin":
+                continue
+            key = (str(endpoint.get("component_id", "")), str(endpoint.get("pin_id", "")))
+            if key in overrides:
+                endpoint["x"], endpoint["y"], endpoint["_egress"] = overrides[key]
+        net["endpoints"] = sorted(
+            net.get("endpoints", []),
+            key=lambda item: (item["x"], item["y"], item.get("component_id", ""), item.get("port_id", "")),
+        )
+
+
+def _label_route_module(
+    module: dict[str, Any],
+    components: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, float]]]:
+    """Connect every net through per-pin stub wires and same-named net labels.
+
+    Board-level designs (connectors, ICs, high-fanout power nets) are drawn
+    with labels in real schematics; the orthogonal autorouter is only
+    guaranteed for compact analog cells.  Each pin gets a short stub along its
+    escape direction and the KiCad writer anchors a local net label at the
+    stub end, so same-named labels reproduce the source partition exactly.
+    The stub geometry still flows through ``verify_routed_connectivity`` so
+    accidental physical contact between stubs of different nets is rejected.
+    """
+
+    nets, ports, _ = _module_net_endpoints(module, components)
+    _apply_library_symbol_pin_positions(nets, components)
+
+    def touches(left_start: dict[str, float], left_end: dict[str, float], right_start: dict[str, float], right_end: dict[str, float]) -> bool:
+        if _point_on_segment(left_start, right_start, right_end) or _point_on_segment(left_end, right_start, right_end):
+            return True
+        if _point_on_segment(right_start, left_start, left_end) or _point_on_segment(right_end, left_start, left_end):
+            return True
+        return _strict_segment_cross((left_start, left_end, {}), (right_start, right_end, {})) is not None
+
+    placed: list[tuple[str, dict[str, float], dict[str, float]]] = []
+    anchors = [
+        (str(net.get("id", "")), {"x": float(endpoint["x"]), "y": float(endpoint["y"])})
+        for net in nets
+        for endpoint in net.get("endpoints", [])
+        if endpoint.get("kind") in {"pin", "port"}
+    ]
+    wires: list[dict[str, Any]] = []
+    for net in nets:
+        net_id = str(net.get("id", ""))
+        net["connection"] = "label"
+        pin_points = [
+            endpoint for endpoint in net.get("endpoints", []) if endpoint.get("kind") == "pin"
+        ]
+        for endpoint in net.get("endpoints", []):
+            kind = endpoint.get("kind")
+            if kind not in {"pin", "port"}:
+                continue
+            if kind == "port":
+                if not pin_points:
+                    # A port with no pins has nothing to join; its label still
+                    # names the net exactly like the routed flow.
+                    continue
+                center_x = sum(float(point["x"]) for point in pin_points) / len(pin_points)
+                center_y = sum(float(point["y"]) for point in pin_points) / len(pin_points)
+                dx = center_x - float(endpoint["x"])
+                dy = center_y - float(endpoint["y"])
+                # A bare port label with no wire under it is a dangling-label
+                # ERC error, so ports also get a stub pointing at their net.
+                endpoint = {
+                    **endpoint,
+                    "_egress": {"x": (1 if dx > 0 else -1) if abs(dx) >= abs(dy) else 0, "y": (1 if dy > 0 else -1) if abs(dy) > abs(dx) else 0},
+                }
+                if not endpoint["_egress"]["x"] and not endpoint["_egress"]["y"]:
+                    endpoint["_egress"] = {"x": 1, "y": 0}
+            start = {"x": float(endpoint["x"]), "y": float(endpoint["y"])}
+            # Dense board placements park opposing pins of different nets a
+            # fixed distance apart, and real library symbols (for example an
+            # MCU's column of left-side pins) fill a whole corridor with stub
+            # endpoints.  A fixed direction/length can therefore always land
+            # on a foreign contact.  Probe the natural escape direction first,
+            # then the perpendiculars, then the opposite direction, each at
+            # several lengths, in a deterministic order.
+            base_egress = endpoint.get("_egress") or {}
+            base_x = int(base_egress.get("x", 0) or 0)
+            base_y = int(base_egress.get("y", 0) or 0)
+            if base_x:
+                directions = [(base_x, 0), (0, 1), (0, -1), (-base_x, 0)]
+            elif base_y:
+                directions = [(0, base_y), (1, 0), (-1, 0), (0, -base_y)]
+            else:
+                directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            chosen: dict[str, float] | None = None
+            chosen_direction: tuple[int, int] | None = None
+            for direction_x, direction_y in directions:
+                probe = {**endpoint, "_egress": {"x": direction_x, "y": direction_y}}
+                for factor in (1, 2, 0.5, 3, 4, 5, 6):
+                    escape = _endpoint_escape(probe, GRID * factor)
+                    if _point_key(escape) == _point_key(start):
+                        continue
+                    clear = True
+                    for other_net, anchor in anchors:
+                        if other_net != net_id and _point_key(anchor) != _point_key(start) and _point_on_segment(anchor, start, escape):
+                            clear = False
+                            break
+                    if clear:
+                        for other_net, seg_start, seg_end in placed:
+                            if other_net != net_id and touches(start, escape, seg_start, seg_end):
+                                clear = False
+                                break
+                    if clear:
+                        chosen = escape
+                        chosen_direction = (direction_x, direction_y)
+                        break
+                if chosen is not None:
+                    break
+            if chosen is None or chosen_direction is None:
+                raise ValueError(
+                    f"label stub for {_routed_endpoint_id(endpoint) or 'endpoint'} "
+                    "contacts a foreign net at every deterministic stub direction and length"
+                )
+            endpoint["_egress"] = {"x": chosen_direction[0], "y": chosen_direction[1]}
+            placed.append((net_id, start, chosen))
+            endpoint_token = _safe_name(str(endpoint.get("component_id", "")) or str(endpoint.get("port_id", "")))
+            pin_token = _safe_name(str(endpoint.get("pin_id", "")) or "port")
+            wires.append({
+                "id": f"{_safe_name(net_id)}-label-{endpoint_token}-{pin_token}",
+                "net_id": net_id,
+                "net": str(net.get("name", net_id)),
+                "from": _endpoint_ref(endpoint),
+                "to": {"x": chosen["x"], "y": chosen["y"]},
+                "points": [start, chosen],
+                "label": True,
+            })
+    return nets, wires, ports
+
+
+def _route_module(
+    module: dict[str, Any],
+    components: list[dict[str, Any]],
+    *,
+    allow_global_fallback: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, float]]]:
+    nets, ports, component_bounds = _module_net_endpoints(module, components)
 
     def semantic_route_priority(net: dict[str, Any]) -> tuple[int, str]:
         name = str(net.get("name", net.get("id", ""))).lower()
@@ -1326,6 +1560,14 @@ def verify_routed_connectivity(nets: list[dict[str, Any]], wires: list[dict[str,
             errors.append(error)
 
     net_by_id = {str(net.get("id", "")): net for net in nets}
+    # Label-connected nets carry no routed tree: their pins join through
+    # same-named net labels in the target schematic.  They are exempt from the
+    # routed-partition, dangling-stub and orphan checks, but their stub wires
+    # still participate in wire well-formedness and foreign-net contact checks
+    # so an accidental physical short is rejected here rather than in KiCad.
+    label_net_ids = {
+        net_id for net_id, net in net_by_id.items() if str(net.get("connection", "")) == "label"
+    }
     expected_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     expected_by_net: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for net in nets:
@@ -1389,7 +1631,8 @@ def verify_routed_connectivity(nets: list[dict[str, Any]], wires: list[dict[str,
                 continue
             segment = (start, end, wire)
             valid_segments.append(segment)
-            segments_by_net.setdefault(net_id, []).append(segment)
+            if net_id not in label_net_ids:
+                segments_by_net.setdefault(net_id, []).append(segment)
 
     for index, left in enumerate(valid_segments):
         for right in valid_segments[index + 1:]:
@@ -1428,6 +1671,8 @@ def verify_routed_connectivity(nets: list[dict[str, Any]], wires: list[dict[str,
         return f"{net_id}@{x:.6f},{y:.6f}"
 
     for net_id, entries in expected_by_net.items():
+        if net_id in label_net_ids:
+            continue
         for endpoint_id, endpoint in entries:
             node = node_id(net_id, endpoint)
             graph.find(node)
@@ -1467,6 +1712,8 @@ def verify_routed_connectivity(nets: list[dict[str, Any]], wires: list[dict[str,
     for endpoint_id, node in endpoint_nodes.items():
         routed_groups.setdefault(graph.find(node), []).append(endpoint_id)
     for net_id, entries in expected_by_net.items():
+        if net_id in label_net_ids:
+            continue
         roots = {graph.find(endpoint_nodes[endpoint_id]) for endpoint_id, _ in entries if endpoint_id in endpoint_nodes}
         if len(roots) > 1:
             add_error(
@@ -1481,7 +1728,7 @@ def verify_routed_connectivity(nets: list[dict[str, Any]], wires: list[dict[str,
                 add_error("orphan_routed_wire", f"net {net_id} contains routed geometry not attached to a source endpoint", net_ids=[net_id])
                 break
 
-    source_partition = sorted(sorted(endpoint_id for endpoint_id, _ in entries) for _, entries in sorted(expected_by_net.items()))
+    source_partition = sorted(sorted(endpoint_id for endpoint_id, _ in entries) for net_id, entries in sorted(expected_by_net.items()) if net_id not in label_net_ids)
     routed_partition = sorted(sorted(group) for group in routed_groups.values())
     source_partition_hash = _sha256_bytes(_canonical_json(source_partition))
     routed_partition_hash = _sha256_bytes(_canonical_json(routed_partition))
@@ -2108,6 +2355,98 @@ def _evaluate_layout_candidate(
     }
 
 
+def _label_layout_candidate(
+    module_id: str,
+    module: dict[str, Any],
+    components: list[dict[str, Any]],
+    source_connectivity_hash: str,
+) -> dict[str, Any]:
+    nets, wires, port_positions = _label_route_module(module, components)
+    report = score_layout(
+        module_id,
+        components,
+        nets,
+        wires,
+        port_positions,
+        source_connectivity_hash,
+        module.get("ports", []),
+    )
+    ports = [
+        {**json.loads(json.dumps(port)), "position": port_positions.get(str(port.get("id", "")))}
+        for port in module.get("ports", [])
+    ]
+    return {
+        "components": components,
+        "ports": ports,
+        "nets": nets,
+        "wires": wires,
+        "quality": report,
+        "connection_mode": "label",
+    }
+
+
+# Nets with more endpoints than this are power/ground-style distribution
+# trees; real schematics draw them with net labels, and the orthogonal
+# autorouter is not guaranteed to find a clean tree for them.  The threshold
+# sits above the fanout of the compact analog cells the router is tuned for
+# (the regression LDO peaks at four endpoints).
+LABEL_MODE_MAX_FANOUT = 6
+
+
+def _module_prefers_label_routing(module: dict[str, Any], components: list[dict[str, Any]]) -> bool:
+    """Deterministic fast path for modules the autorouter cannot or should not route."""
+
+    for component in components:
+        eda = component.get("eda") if isinstance(component.get("eda"), dict) else {}
+        if str(eda.get("symbol", "")).strip():
+            # Routed wires anchor at generated glyph geometry; a real library
+            # symbol exposes its pins at the library's own coordinates, so
+            # only label stubs (anchored via symbol_pin_positions) connect.
+            return True
+    _, ids_by_name = _declared_net_maps(module)
+    fanout: dict[str, int] = {}
+    for component in components:
+        seen_points: dict[tuple[float, float], str] = {}
+        for index, pin in enumerate(component.get("pins", [])):
+            net_id = _endpoint_net_id(pin, ids_by_name)
+            fanout[net_id] = fanout.get(net_id, 0) + 1
+            point = _point_key(_pin_position(component, pin, index))
+            if point in seen_points and seen_points[point] != net_id:
+                # Two pins on different nets share one anchor, so any physical
+                # route would be a foreign-net contact by construction.
+                return True
+            seen_points[point] = net_id
+    for port in module.get("ports", []):
+        net_id = _endpoint_net_id(port, ids_by_name)
+        fanout[net_id] = fanout.get(net_id, 0) + 1
+    return max(fanout.values(), default=0) > LABEL_MODE_MAX_FANOUT
+
+
+def _first_label_layout_candidate(
+    module_id: str,
+    module: dict[str, Any],
+    candidates: list[list[dict[str, Any]]],
+    source_connectivity_hash: str,
+) -> dict[str, Any]:
+    """Return the first candidate whose label stubs avoid foreign contacts.
+
+    Source placements may stack two library-symbol components so their real
+    pins coincide (auto-grid collisions); a straight label stub from such a
+    point contacts the foreign pin at every direction and length.  Trying the
+    deterministic candidate list in order keeps the source layout when it
+    works and falls back to the lane-based variants when it does not.
+    """
+
+    failures: list[str] = []
+    for components in candidates:
+        try:
+            return _label_layout_candidate(module_id, module, components, source_connectivity_hash)
+        except ValueError as error:
+            failures.append(str(error))
+    details = "; ".join(sorted(set(failures)))
+    raise ValueError(f"no deterministic layout candidate avoided label stub conflicts: {details}")
+
+
 def _best_layout_candidate(module_id: str, module: dict[str, Any], view: str, source_connectivity_hash: str) -> dict[str, Any]:
     cache_key = _sha256_bytes(_canonical_json({"module_id": module_id, "module": module, "view": view, "connectivity_hash": source_connectivity_hash}))
     cached = _LAYOUT_CACHE.get(cache_key)
@@ -2115,7 +2454,12 @@ def _best_layout_candidate(module_id: str, module: dict[str, Any], view: str, so
         return json.loads(json.dumps(cached))
     winners: list[dict[str, Any]] = []
     failures: list[str] = []
-    for components in _layout_candidates(module, view):
+    candidates = _layout_candidates(module, view)
+    if candidates and candidates[0] and _module_prefers_label_routing(module, candidates[0]):
+        winner = _first_label_layout_candidate(module_id, module, candidates, source_connectivity_hash)
+        _LAYOUT_CACHE[cache_key] = json.loads(json.dumps(winner))
+        return winner
+    for components in candidates:
         try:
             candidate = _evaluate_layout_candidate(module_id, module, components, source_connectivity_hash)
             winners.append(candidate)
@@ -2136,6 +2480,13 @@ def _best_layout_candidate(module_id: str, module: dict[str, Any], view: str, so
         except ValueError as error:
             failures.append(str(error))
     if not winners:
+        if candidates and candidates[0]:
+            # Physical routing is best-effort.  A module whose placement the
+            # autorouter cannot preserve still exports deterministically
+            # through net-label stubs instead of failing the whole export.
+            winner = _first_label_layout_candidate(module_id, module, candidates, source_connectivity_hash)
+            _LAYOUT_CACHE[cache_key] = json.loads(json.dumps(winner))
+            return winner
         details = "; ".join(sorted(set(failures)))
         raise ValueError(f"no deterministic layout candidate preserved routed connectivity: {details}")
     winner = min(winners, key=lambda candidate: candidate["quality"]["lexicographic_cost"])
@@ -3159,7 +3510,7 @@ def _kicad_symbol_definition(component: dict[str, Any], binding: dict[str, Any],
     eda = component.get("eda") or {}
     reference = str(eda.get("refdes_prefix", component.get("type", "X")))[:2] or "X"
     physical = bool(eda.get("physical", str(component.get("type", "")).upper() in {"R", "C", "L", "D", "M", "Q"}))
-    footprint = str(binding.get("footprint") or component.get("footprint") or "")
+    footprint = str(binding.get("footprint") or component.get("footprint") or eda.get("footprint") or "")
     hide_pin_names = " hide" if eda.get("device_class") in {"resistor", "capacitor", "inductor"} else ""
     lines = [
         f"{indent}(symbol {_sexpr_string(symbol_name)}",
@@ -3263,11 +3614,14 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
     embedded: set[str] = set()
     for entry in all_components:
         binding = binding_for(symbol_map, "kicad", entry["page_id"], entry)
-        _, _, lib_id = _kicad_binding_identity(binding)
+        library, cell, lib_id = _kicad_binding_identity(binding)
         if lib_id in embedded:
             continue
         embedded.add(lib_id)
-        lines.extend(_kicad_symbol_definition(entry, binding, embedded=True, indent="    "))
+        if binding.get("library_symbol"):
+            lines.extend(symbol_definition_lines(library, cell, name=lib_id, indent="    "))
+        else:
+            lines.extend(_kicad_symbol_definition(entry, binding, embedded=True, indent="    "))
     lines.append("  )")
     projected_wires: list[dict[str, Any]] = []
     for wire in page["wires"]:
@@ -3297,21 +3651,83 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
             f"(color 0 0 0 0) (uuid {_stable_uuid(page['id'], net_id, 'junction', x, y)}))"
         )
     port_nets = {str(port.get("net", "")) for port in page["ports"]}
+    label_nets = {
+        str(net.get("id", "")): net
+        for net in page["nets"]
+        if str(net.get("connection", "")) == "label"
+    }
     for net in page["nets"]:
+        if str(net.get("id", "")) in label_nets:
+            continue
         if str(net.get("name", "")) in port_nets:
             continue
         if net["endpoints"]:
             point = net["endpoints"][0]
             point_x, point_y = at_mm(point)
             lines.append(f"  (global_label {_sexpr_string(net['name'])} (shape bidirectional) (at {point_x:.4f} {point_y:.4f} 0) (fields_autoplaced yes) (effects (font (size 1.27 1.27)) (justify left)) (uuid {_stable_uuid(page['id'], net['id'])}))")
+    port_names = {str(port.get("id", "")): str(port.get("name", "")) for port in page["ports"]}
+    # Label stubs survive wire materialization as pin/port-anchored two-point
+    # wires; labels anchor at the materialized stub end so they always sit
+    # exactly on an exported wire endpoint.
+    label_stub_ends: dict[tuple[str, str], dict[str, Any]] = {}
+    port_stub_ends: dict[str, dict[str, Any]] = {}
+    for wire in page["wires"]:
+        reference = wire.get("from") or {}
+        points = wire.get("points") or []
+        if not points:
+            continue
+        if reference.get("component_id") and reference.get("pin_id"):
+            label_stub_ends[(str(reference["component_id"]), str(reference["pin_id"]))] = points[-1]
+        elif reference.get("port_id"):
+            port_stub_ends[str(reference["port_id"])] = points[-1]
+    label_port_ids = {
+        str(endpoint.get("port_id", ""))
+        for net in label_nets.values()
+        for endpoint in net.get("endpoints", [])
+        if endpoint.get("kind") == "port"
+    }
     for port in page["ports"]:
         position = port.get("position")
         if not position:
             continue
         shape = {"input": "input", "output": "output"}.get(port.get("direction"), "bidirectional")
         label_kind = "global_label" if root_page else "hierarchical_label"
-        position_x, position_y = at_mm(position)
+        anchor = position
+        if str(port.get("id", "")) in label_port_ids:
+            anchor = port_stub_ends.get(str(port.get("id", "")), position)
+        position_x, position_y = at_mm(anchor)
         lines.append(f"  ({label_kind} {_sexpr_string(port['name'])} (shape {shape}) (at {position_x:.4f} {position_y:.4f} 0) (fields_autoplaced yes) (effects (font (size 1.27 1.27)) (justify left)) (uuid {_stable_uuid(page['id'], 'port', port['id'])}))")
+    for net_id in sorted(label_nets):
+        net = label_nets[net_id]
+        port_label_names = sorted({
+            port_names.get(str(endpoint.get("port_id", "")), "")
+            for endpoint in net.get("endpoints", [])
+            if endpoint.get("kind") == "port"
+        } - {""})
+        # A port label must name the whole labelled group, so the pin stubs
+        # adopt the port's name whenever the net has one.
+        label_name = port_label_names[0] if port_label_names else str(net.get("name", net_id))
+        for endpoint in net.get("endpoints", []):
+            if endpoint.get("kind") != "pin":
+                continue
+            stub_end = label_stub_ends.get((str(endpoint.get("component_id", "")), str(endpoint.get("pin_id", ""))))
+            if stub_end is None:
+                continue
+            label_x, label_y = at_mm(stub_end)
+            egress = endpoint.get("_egress") or {}
+            if float(egress.get("x", 0) or 0) > 0:
+                angle, justify = 0, "left"
+            elif float(egress.get("x", 0) or 0) < 0:
+                angle, justify = 0, "right"
+            elif float(egress.get("y", 0) or 0) > 0:
+                angle, justify = 270, "left"
+            else:
+                angle, justify = 90, "left"
+            lines.append(
+                f"  (label {_sexpr_string(label_name)} (at {label_x:.4f} {label_y:.4f} {angle}) "
+                f"(fields_autoplaced yes) (effects (font (size 1.27 1.27)) (justify {justify})) "
+                f"(uuid {_stable_uuid(page['id'], net_id, 'label', endpoint.get('component_id', ''), endpoint.get('pin_id', ''))}))"
+            )
     for component in page["components"]:
         position = component["position"]
         binding = binding_for(symbol_map, "kicad", page["id"], component)
@@ -3346,6 +3762,11 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
             lines.append(
                 f"    (property \"MPN\" {_sexpr_string(eda.get('mpn'))} (at 0 0 0) (effects (font (size 1.27 1.27)) hide))"
             )
+        instance_footprint = str(eda.get("footprint") or component.get("footprint") or "").strip()
+        if instance_footprint:
+            lines.append(
+                f"    (property \"Footprint\" {_sexpr_string(instance_footprint)} (at 0 0 0) (effects (font (size 1.27 1.27)) hide))"
+            )
         for pin in component.get("pins", []):
             target_pin = str(binding["pin_map"][str(pin["id"])])
             lines.append(f"    (pin {_sexpr_string(target_pin)} (uuid {_stable_uuid(page['id'], component['id'], pin['id'])}))")
@@ -3370,7 +3791,12 @@ def _write_kicad(root: Path, project_name: str, ir: dict[str, Any], symbol_map: 
         binding = binding_for(symbol_map, "kicad", component["page_id"], component)
         library, cell, lib_id = _kicad_binding_identity(binding)
         existing = libraries.setdefault(library, {}).get(cell)
-        if existing and _kicad_symbol_signature(existing[0], existing[1]) != _kicad_symbol_signature(component, binding):
+        if (
+            existing
+            and not binding.get("library_symbol")
+            and not existing[1].get("library_symbol")
+            and _kicad_symbol_signature(existing[0], existing[1]) != _kicad_symbol_signature(component, binding)
+        ):
             raise ValueError(
                 f"conflicting KiCad symbol definitions for {lib_id}; "
                 "map components with different pin geometry to distinct cells"
@@ -3390,7 +3816,10 @@ def _write_kicad(root: Path, project_name: str, ir: dict[str, Any], symbol_map: 
         symbols = target / filename
         symbol_lines = ["(kicad_symbol_lib (version 20231120) (generator actoviq)"]
         for _, (component, binding) in sorted(cells.items()):
-            symbol_lines.extend(_kicad_symbol_definition(component, binding, embedded=False, indent="  "))
+            if binding.get("library_symbol"):
+                symbol_lines.extend(symbol_definition_lines(library, str(binding["cell"]), indent="  "))
+            else:
+                symbol_lines.extend(_kicad_symbol_definition(component, binding, embedded=False, indent="  "))
         symbol_lines.append(")\n")
         _write_text(symbols, "\n".join(symbol_lines))
         symbol_files.append(symbols)
@@ -3428,11 +3857,22 @@ def _write_kicad(root: Path, project_name: str, ir: dict[str, Any], symbol_map: 
                 pin_x = x + width if output else x
                 pin_y = y + 5.08 + port_index * 5.08
                 shape = {"input": "input", "output": "output"}.get(port.get("direction"), "bidirectional")
-                angle = 180 if output else 0
+                # KiCad sheet pins extend from their anchor in the angle
+                # direction and connect at the far tip: pins on the left edge
+                # must face 180 and pins on the right edge must face 0,
+                # otherwise the anchor sits at the box edge with the live tip
+                # pointing into the sheet and nothing ever connects to it.
+                angle = 0 if output else 180
                 lines.append(f"    (pin {_sexpr_string(port['name'])} {shape} (at {pin_x:.4f} {pin_y:.4f} {angle}) (effects (font (size 1.27 1.27))) (uuid {_stable_uuid(page['id'], 'root-pin', port['id'])}))")
                 global_net = global_port_nets.get((page["id"], port["id"]), f"{page['id']}:{port.get('net', '')}")
-                justify = "right" if output else "left"
-                root_labels.append(f"  (global_label {_sexpr_string(global_net)} (shape {shape}) (at {pin_x:.4f} {pin_y:.4f} {angle}) (fields_autoplaced yes) (effects (font (size 1.27 1.27)) (justify {justify})) (uuid {_stable_uuid(page['id'], 'root-label', port['id'])}))")
+                # KiCad does not attach a label to a bare sheet pin, so bridge
+                # the pin and its global label with a short wire stub that
+                # leaves the sheet box (left on the left edge, right on the
+                # right edge).
+                label_x = pin_x + (5.08 if output else -5.08)
+                justify = "left" if output else "right"
+                root_labels.append(f"  (wire (pts (xy {pin_x:.4f} {pin_y:.4f}) (xy {label_x:.4f} {pin_y:.4f})) (stroke (width 0) (type default)) (uuid {_stable_uuid(page['id'], 'root-wire', port['id'])}))")
+                root_labels.append(f"  (global_label {_sexpr_string(global_net)} (shape {shape}) (at {label_x:.4f} {pin_y:.4f} 0) (fields_autoplaced yes) (effects (font (size 1.27 1.27)) (justify {justify})) (uuid {_stable_uuid(page['id'], 'root-label', port['id'])}))")
             lines.extend(["    (instances", f"      (project {_sexpr_string(project_name)} (path {_sexpr_string('/' + sheet_uuid)} (page {_sexpr_string(str(page_index + 2))})))", "    )", "  )"])
         lines.extend(root_labels)
         lines.extend(["  (sheet_instances (path \"/\" (page \"1\")))", ")\n"])
