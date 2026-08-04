@@ -261,7 +261,11 @@ subset (`kicad-lib-search` / `kicad-lib-get` to browse):
   `pcb_export_readiness` (`missing_symbol` / `missing_footprint` /
   `unknown_library_part`).
 - Re-placing the same `name` updates the existing component instead of
-  duplicating it.
+  duplicating it. Without an explicit `position`, new components take the
+  first slot of a 60-unit row-major grid (origin 160,160; 8 columns) whose
+  outline — `block` width/height for blocks, the standard glyph extent for
+  primitives — clears every already-placed component's bounds by >= 60
+  units, so large blocks are never packed into their neighbors.
 
 ## Convergence Rules
 

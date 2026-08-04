@@ -29,6 +29,7 @@ from workspace_paths import (
     select_workspace,
 )
 from eda_export import (
+    _component_bounds,
     _evaluate_layout_candidate,
     connectivity_hash,
     evaluate_layout_patches,
@@ -2636,6 +2637,74 @@ def library_block_layout(
     return layout, block
 
 
+# Auto-placement grid for library components.  The slot pitch is a multiple
+# of the 20-unit editor grid; the pitch only orders the scan — actual
+# clearance comes from the pairwise bounds check below, so large BLOCKs
+# (e.g. a 260x460 MCU) never get neighbors packed into their outline.
+LIBRARY_PLACE_ORIGIN = 160.0
+LIBRARY_PLACE_PITCH = 60.0
+LIBRARY_PLACE_COLUMNS = 8
+LIBRARY_PLACE_MAX_ROWS = 512
+LIBRARY_PLACE_MARGIN = 60.0
+
+
+def _bounds_clear(
+    candidate: dict[str, float],
+    occupied: list[dict[str, float]],
+    margin: float,
+) -> bool:
+    for other in occupied:
+        separated = (
+            candidate["max_x"] + margin <= other["min_x"]
+            or other["max_x"] + margin <= candidate["min_x"]
+            or candidate["max_y"] + margin <= other["min_y"]
+            or other["max_y"] + margin <= candidate["min_y"]
+        )
+        if not separated:
+            return False
+    return True
+
+
+def library_auto_position(
+    shape: dict[str, Any],
+    existing: list[dict[str, Any]],
+) -> dict[str, float]:
+    """First grid slot whose bounds clear every existing component's bounds.
+
+    Slots march row-major from LIBRARY_PLACE_ORIGIN on LIBRARY_PLACE_PITCH;
+    bounds come from eda_export._component_bounds for both the candidate
+    shape (BLOCK block width/height, primitive glyph extent) and the
+    components already in the module, so the layout is deterministic and
+    keeps at least LIBRARY_PLACE_MARGIN between edges.
+    """
+    occupied: list[dict[str, float]] = []
+    for component in existing:
+        try:
+            occupied.append(_component_bounds(component))
+        except Exception:
+            continue
+    for slot in range(LIBRARY_PLACE_COLUMNS * LIBRARY_PLACE_MAX_ROWS):
+        candidate = {
+            "x": LIBRARY_PLACE_ORIGIN + (slot % LIBRARY_PLACE_COLUMNS) * LIBRARY_PLACE_PITCH,
+            "y": LIBRARY_PLACE_ORIGIN + (slot // LIBRARY_PLACE_COLUMNS) * LIBRARY_PLACE_PITCH,
+        }
+        bounds = _component_bounds({**shape, "position": candidate})
+        if _bounds_clear(bounds, occupied, LIBRARY_PLACE_MARGIN):
+            return candidate
+    # Absurdly dense sheet: deterministic far-right seat on the editor grid.
+    half_width = 60.0
+    try:
+        probe = _component_bounds({**shape, "position": {"x": 0.0, "y": 0.0}})
+        half_width = (probe["max_x"] - probe["min_x"]) / 2
+    except Exception:
+        pass
+    right_edge = max((bounds["max_x"] for bounds in occupied), default=LIBRARY_PLACE_ORIGIN)
+    return {
+        "x": math.ceil((right_edge + LIBRARY_PLACE_MARGIN + half_width) / 20.0) * 20.0,
+        "y": LIBRARY_PLACE_ORIGIN,
+    }
+
+
 def place_library_component(
     project: dict[str, Any],
     modules: dict[str, dict[str, Any]],
@@ -2745,39 +2814,14 @@ def place_library_component(
     )
     if existing is None:
         used_ids = {str(component.get("id", "")) for component in components}
-        slot = len(components)
         if position is None:
-            # The BLOCK and primitive auto-grids use different origins and
-            # spacings, so their slots can coincide (and any grid slot can
-            # collide with an explicitly positioned part).  Advance to the
-            # first slot that keeps clearance from everything already placed.
-            occupied = [
-                (float(placed["position"]["x"]), float(placed["position"]["y"]))
-                for placed in components
-                if isinstance(placed.get("position"), dict)
-                and isinstance(placed["position"].get("x"), (int, float))
-                and isinstance(placed["position"].get("y"), (int, float))
-            ]
-            while True:
-                candidate = (
-                    {
-                        "x": 160.0 + (slot % 3) * 260.0,
-                        "y": 160.0 + (slot // 3) * 260.0,
-                    }
-                    if block is not None
-                    else {
-                        # Same auto-grid as parse_editable_netlist_components.
-                        "x": 140.0 + (slot % 4) * 180.0,
-                        "y": 120.0 + (slot // 4) * 140.0,
-                    }
-                )
-                if all(
-                    abs(candidate["x"] - occupied_x) >= 80.0 or abs(candidate["y"] - occupied_y) >= 80.0
-                    for occupied_x, occupied_y in occupied
-                ):
-                    position = candidate
-                    break
-                slot += 1
+            # Bounding-box aware: scan grid slots until the candidate outline
+            # (BLOCK block width/height or primitive glyph extent) clears the
+            # bounds of everything already placed, plus margin.
+            position = library_auto_position(
+                {"type": component_type, "pins": pins, "block": block, "rotation": 0},
+                components,
+            )
         component = {
             "id": editable_component_id(name, used_ids),
             "type": component_type,

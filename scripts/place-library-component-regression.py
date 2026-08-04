@@ -18,7 +18,7 @@ SKILL_SCRIPTS = REPO / "skills" / "circuit-design-ngspice" / "scripts"
 sys.path.insert(0, str(SKILL_SCRIPTS))
 
 import circuit_project as cp  # noqa: E402
-from eda_export import SYMBOL_MAP_SCHEMA, _stable_uuid, export_eda  # noqa: E402
+from eda_export import SYMBOL_MAP_SCHEMA, _component_bounds, _stable_uuid, export_eda  # noqa: E402
 from eda_kicad_validate import validate_kicad_package  # noqa: E402
 from eda_symbols import resolve_symbol_map  # noqa: E402
 from kicad_library import get_symbol, load_index, resolve_lib_root  # noqa: E402
@@ -469,6 +469,121 @@ def main() -> int:
         )
         report = validate_kicad_package(kicad_dir, ir, resolved_map)
         assert report["passed"], report
+
+        # Auto-placement: a full board set (48-pin MCU BLOCK, LDO, crystals,
+        # switch, 20 passives, plus a netlist-seeded resistor) must never
+        # overlap — every pair of component bounds stays disjoint with at
+        # least the placement margin between edges.
+        full_ops: list[dict] = [
+            {
+                "op": "upsert_module_netlist",
+                "module_id": "full_board",
+                "name": "Full board",
+                "netlist_notebook": "* seeded\nR1 vdd_3v3 gnd 10k\n",
+            },
+            {
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": "XU1",
+                "value": "STM32F103C8T6",
+                "symbol": STM32,
+                "pin_nets": pin_nets_for(stm32, stm32_net),
+            },
+            {
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": "XU2",
+                "value": "AMS1117-3.3",
+                "symbol": AMS1117,
+                "pin_nets": ams_nets,
+            },
+            {
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": "XX1",
+                "value": "8MHz",
+                "symbol": "Device:Crystal",
+                "footprint": "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm",
+                "pin_nets": {"1": "osc_in", "2": "gnd"},
+            },
+            {
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": "XX2",
+                "value": "32.768kHz",
+                "symbol": "Device:Crystal",
+                "footprint": "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm",
+                "pin_nets": {"1": "osc32_in", "2": "gnd"},
+            },
+            {
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": "SW1",
+                "value": "reset",
+                "symbol": "Switch:SW_Push",
+                "footprint": "Button_Switch_SMD:SW_SPST_TL3342",
+                "pin_nets": {"1": "nrst", "2": "gnd"},
+            },
+        ]
+        for index in range(8):
+            full_ops.append({
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": f"R1{index}",
+                "value": "10k",
+                "symbol": DEVICE_R,
+                "pin_nets": {"1": f"r{index}_a", "2": f"r{index}_b"},
+            })
+            full_ops.append({
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": f"C1{index}",
+                "value": "100n",
+                "symbol": DEVICE_C,
+                "pin_nets": {"1": f"c{index}_a", "2": "gnd"},
+            })
+        for index in range(4):
+            full_ops.append({
+                "op": "place_library_component",
+                "module_id": "full_board",
+                "name": f"D1{index}",
+                "value": "LED",
+                "symbol": DEVICE_LED,
+                "pin_nets": {"1": "gnd", "2": f"led{index}"},
+            })
+        project_now, _ = cp.load_project(root)
+        cp.apply_command(root, command(project_now, project_now["revision"], "place-library-full-board", full_ops))
+        full_module = json.loads(
+            (root / "modules" / "full_board" / "module.circuit.json").read_text(encoding="utf-8")
+        )
+        full_components = full_module["components"]
+        assert len(full_components) == 1 + 2 + 2 + 1 + 8 + 8 + 4, len(full_components)
+        bounds = {
+            component["id"]: _component_bounds(component)
+            for component in full_components
+        }
+        ids = sorted(bounds)
+        min_separation = float("inf")
+        for left_index, left_id in enumerate(ids):
+            for right_id in ids[left_index + 1:]:
+                left, right = bounds[left_id], bounds[right_id]
+                intersects = (
+                    left["min_x"] < right["max_x"] and right["min_x"] < left["max_x"]
+                    and left["min_y"] < right["max_y"] and right["min_y"] < left["max_y"]
+                )
+                assert not intersects, f"components overlap: {left_id} {left} vs {right_id} {right}"
+                separation = max(
+                    right["min_x"] - left["max_x"],
+                    left["min_x"] - right["max_x"],
+                    right["min_y"] - left["max_y"],
+                    left["min_y"] - right["max_y"],
+                )
+                min_separation = min(min_separation, separation)
+        assert min_separation >= 60.0 - 1e-9, f"edge clearance below margin: {min_separation}"
+        # Positions stay on the 20-unit editor grid.
+        for component in full_components:
+            assert component["position"]["x"] % 20 == 0, component["position"]
+            assert component["position"]["y"] % 20 == 0, component["position"]
 
     print("place-library-component regression ok")
     return 0
