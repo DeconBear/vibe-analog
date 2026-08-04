@@ -225,6 +225,44 @@ Stale `base_revision` / module revision must be rejected — reread
 [schematic-editor-guide.md](schematic-editor-guide.md) and
 `schemas/command.v2.schema.json`.
 
+### Placing parts from the bundled KiCad library
+
+`place_library_component` (command.v1, `pcb_schematic` projects only) creates
+or updates a `type: "BLOCK"` component from the bundled KiCad symbol/footprint
+subset (`kicad-lib-search` / `kicad-lib-get` to browse):
+
+```json
+{"op": "place_library_component", "module_id": "mcu_core",
+ "name": "XU1", "value": "STM32F103C8T6",
+ "symbol": "MCU_ST_STM32F1:STM32F103C8Tx",
+ "footprint": "Package_QFP:LQFP-48_7x7mm_P0.5mm",
+ "pin_nets": {"1": "vdd_3v3", "34": "pa13"},
+ "position": {"x": 300, "y": 200}}
+```
+
+- Pins come from the symbol: `id` = pin number, `name` = pin name (VBAT,
+  PA13, ...), `side`/`order` mirror the KiCad symbol geometry so the block
+  roughly keeps the symbol shape; `block.width`/`height` follow the pin count.
+- Symbols mapping to SPICE primitives place native components instead of
+  blocks: `Device:R` → `type: "R"`, `Device:C` → `type: "C"`, `Device:LED` →
+  `type: "D"`. These keep the netlist pin idiom (`a`/`b`, D uses `a`=anode /
+  `b`=cathode) so they render as classic glyphs and behave exactly like
+  netlist-created parts; `pin_nets` is still keyed by KiCad pin number
+  (R/C: `1`→a, `2`→b; LED: `1`(K)→b, `2`(A)→a). KiCad export translates the
+  pins back by role (R/C a→1, b→2; D a→2, b→1) and any module containing an
+  `eda.symbol` component exports through net-label routing, since only label
+  stubs anchor at the real library symbol pin coordinates.
+- `pin_nets` is keyed by pin number and must cover **exactly** the symbol's
+  pins — missing, extra, or empty entries fail the transaction and list the
+  difference. Give NC pins distinct `nc_*` nets.
+- `footprint` is optional; default is the symbol's `default_footprint`
+  (0603 SMD fallback for basic `Device:R/C/LED`). The final
+  `eda.symbol`/`eda.footprint`/`eda.refdes` land on the component and feed
+  `pcb_export_readiness` (`missing_symbol` / `missing_footprint` /
+  `unknown_library_part`).
+- Re-placing the same `name` updates the existing component instead of
+  duplicating it.
+
 ## Convergence Rules
 
 During the netlist design step (Step 5), follow these rules:

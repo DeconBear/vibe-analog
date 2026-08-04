@@ -1,0 +1,12 @@
+This directory bundles a subset of the official KiCad symbol and footprint
+libraries, fetched from:
+
+- https://gitlab.com/kicad/libraries/kicad-symbols   (tag 8.0.9)
+- https://gitlab.com/kicad/libraries/kicad-footprints (tag 8.0.9)
+
+The KiCad libraries are licensed under Creative Commons CC-BY-SA 4.0
+(https://creativecommons.org/licenses/by-sa/4.0/) with an exception that
+does not restrict the use of symbols/footprints in electronic designs:
+https://www.kicad.org/libraries/license/
+
+See manifest.json for the exact file list.

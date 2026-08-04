@@ -105,6 +105,12 @@ python scripts/circuit_project.py bridge-import-cold --peer-kind kicad --peer-ro
 python scripts/circuit_project.py lcsc-search --query "1k 0603" --use-fallback
 python scripts/circuit_project.py lcsc-bind --project-root <project-root> --module-id <m> --component-id <c> --lcsc-id C21190 --use-fallback
 
+# Bundled KiCad library (assets/kicad-lib, CC-BY-SA subset): search/bind real symbols
+python scripts/circuit_project.py kicad-lib-search --query "stm32f103"
+python scripts/circuit_project.py kicad-lib-get --symbol MCU_ST_STM32F1:STM32F103C8Tx
+# place_library_component (command.v1 op): instantiate a library symbol as a
+# named-pin BLOCK with eda.symbol/eda.footprint; pin_nets maps pin number -> net.
+
 # Analog IC (external PDK remains licensed/user-supplied)
 python scripts/circuit_project.py create --name "OTA" --project-kind analog_ic
 python scripts/circuit_project.py analog-ic-audit --project-root <project-root>
@@ -165,6 +171,7 @@ error table:
 | `project_kinds.py` / `stable_ids.py` | Project kind gates + persistent `stable_id` |
 | `eda_bridge.py` / `eda_kicad_import.py` / `eda_jlceda_*` | PCB layout/property handoff (KiCad + experimental, vendor-unverified JLCEDA exchange JSON); not lossless connectivity co-editing |
 | `lcsc_search.py` | 立创商城 search / get / bind (`eda.lcsc_id`) |
+| `kicad_library.py` | Bundled KiCad lib index (`assets/kicad-lib`): symbol/footprint search, pin maps, raw S-expr; `kicad-lib-search/get/reindex` CLI |
 | `analog_ic.py` | PDK/model-path and MOS W/L/M/NF audit before analog simulation/export |
 | `pdk_registry.py` / `open_sim_providers.py` / `physical_verification.py` | Local PDK registry, OpenVAF/Xyce, and KLayout/Magic/Netgen providers |
 | `schematic_handoff.py` | Desktop Import/Export schematic (KiCad/JLCEDA/… + Virtuoso/Xschem) |

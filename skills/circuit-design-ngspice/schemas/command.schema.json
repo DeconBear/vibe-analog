@@ -33,6 +33,7 @@
               "upsert_module_netlist",
               "remove_module",
               "add_component",
+              "place_library_component",
               "remove_component",
               "add_port",
               "set_module_schematic",

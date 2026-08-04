@@ -37,6 +37,7 @@ const NESTED_OPERATION_NAMES = new Set([
   'upsert_module',
   'remove_module',
   'add_component',
+  'place_library_component',
   'remove_component',
   'add_port',
   'move_module',

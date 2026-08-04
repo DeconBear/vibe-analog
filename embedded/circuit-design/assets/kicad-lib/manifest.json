@@ -1,0 +1,32 @@
+{
+  "schema": "actoviq.kicad-lib-manifest.v1",
+  "description": "Bundled subset of the official KiCad symbol/footprint libraries used by the pcb_schematic flow.",
+  "source": {
+    "symbols": "https://gitlab.com/kicad/libraries/kicad-symbols",
+    "footprints": "https://gitlab.com/kicad/libraries/kicad-footprints",
+    "ref": "8.0.9",
+    "license": "CC-BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/), with the KiCad library exception for design use",
+    "fetched_at": "2026-08-04"
+  },
+  "symbols": [
+    "Device.kicad_sym",
+    "Connector.kicad_sym",
+    "MCU_ST_STM32F1.kicad_sym",
+    "Regulator_Linear.kicad_sym",
+    "Switch.kicad_sym",
+    "power.kicad_sym"
+  ],
+  "footprints": [
+    "Package_QFP.pretty/LQFP-48_7x7mm_P0.5mm.kicad_mod",
+    "Capacitor_SMD.pretty/C_0603_1608Metric.kicad_mod",
+    "Resistor_SMD.pretty/R_0603_1608Metric.kicad_mod",
+    "LED_SMD.pretty/LED_0805_2012Metric.kicad_mod",
+    "Crystal.pretty/Crystal_SMD_3225-4Pin_3.2x2.5mm.kicad_mod",
+    "Connector_USB.pretty/USB_Micro-B_Molex_47346-0001.kicad_mod",
+    "Package_TO_SOT_SMD.pretty/SOT-223-3_TabPin2.kicad_mod",
+    "Connector_PinHeader_2.54mm.pretty/PinHeader_1x03_P2.54mm_Vertical.kicad_mod",
+    "Connector_PinHeader_2.54mm.pretty/PinHeader_1x04_P2.54mm_Vertical.kicad_mod",
+    "Connector_PinHeader_2.54mm.pretty/PinHeader_1x08_P2.54mm_Vertical.kicad_mod",
+    "Button_Switch_SMD.pretty/SW_SPST_TL3342.kicad_mod"
+  ]
+}

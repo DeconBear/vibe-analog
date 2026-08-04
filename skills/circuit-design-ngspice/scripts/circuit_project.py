@@ -2058,6 +2058,13 @@ def evaluate_erc(
             for line in (module.get("spice") or {}).get("models", [])
             if (match := re.match(r"(?i)^\s*\.model\s+(\S+)", str(line)))
         }
+        # PCB schematics are not simulated; a missing SPICE model for a LED or
+        # transistor is a note for the designer, not a blocking error.
+        model_severity = (
+            "error"
+            if requires_simulation(normalize_project_kind(project.get("project_kind")))
+            else "warning"
+        )
         for component in module.get("components", []):
             component_type = str(component.get("type", "")).upper()
             if component_type not in {"D", "Q", "M"}:
@@ -2066,7 +2073,7 @@ def evaluate_erc(
             if not model_name or "=" in model_name or model_name.lower() not in model_names:
                 erc_diagnostic(
                     diagnostics,
-                    "error",
+                    model_severity,
                     "missing_device_model",
                     f"{component.get('name', component.get('id'))} references model {model_name or '(missing)'}, but no matching .model is preserved.",
                     module_id=module_id,
@@ -2458,6 +2465,7 @@ NESTED_OPERATION_NAMES = frozenset({
     "upsert_module",
     "remove_module",
     "add_component",
+    "place_library_component",
     "remove_component",
     "add_port",
     "move_module",
@@ -2508,6 +2516,275 @@ def normalize_operation(operation: Any) -> dict[str, Any]:
             f"{nested_keys}; use one flat {{op, ...}} object per array entry"
         )
     return operation
+
+
+# ---------------------------------------------------------------------------
+# KiCad library placement (place_library_component)
+# ---------------------------------------------------------------------------
+
+_KICAD_LIBRARY_INDEX: dict[str, Any] | None = None
+
+
+def kicad_library_index() -> dict[str, Any]:
+    """Lazy process-wide index over the bundled KiCad library subset."""
+    global _KICAD_LIBRARY_INDEX
+    if _KICAD_LIBRARY_INDEX is None:
+        from kicad_library import load_index, resolve_lib_root
+
+        _KICAD_LIBRARY_INDEX = load_index(resolve_lib_root())
+    return _KICAD_LIBRARY_INDEX
+
+
+# Sensible SMD defaults for basic Device:* symbols whose KiCad
+# default_footprint is intentionally blank. Only used when the footprint
+# actually exists in the bundled index.
+LIBRARY_FALLBACK_FOOTPRINTS = {
+    "Device:R": "Resistor_SMD:R_0603_1608Metric",
+    "Device:C": "Capacitor_SMD:C_0603_1608Metric",
+    "Device:LED": "LED_SMD:LED_0805_2012Metric",
+}
+
+# KiCad symbols that map onto native SPICE primitives instead of BLOCK boxes,
+# so passives render with their classic glyphs and flow through the existing
+# primitive ERC/compile paths.  Everything else stays a BLOCK.
+LIBRARY_PRIMITIVE_TYPES = {
+    "Device:R": "R",
+    "Device:C": "C",
+    "Device:LED": "D",
+}
+
+# pin_nets is keyed by KiCad package pin number; native primitives keep the
+# netlist pin idiom (EDITABLE_PIN_NAMES).  KiCad Device diodes/LEDs number the
+# cathode as pin 1 and the anode as pin 2, so D swaps the a/b roles.
+LIBRARY_PRIMITIVE_PIN_ROLES = {
+    "R": {"1": "a", "2": "b"},
+    "C": {"1": "a", "2": "b"},
+    "D": {"1": "b", "2": "a"},
+}
+
+
+def resolve_library_footprint(
+    index: dict[str, Any],
+    symbol_entry: dict[str, Any] | None,
+    explicit: str = "",
+) -> str:
+    """Resolve the final footprint for a library placement.
+
+    An explicit footprint must exist in the bundled index; otherwise fall
+    back to the symbol's default_footprint, then to LIBRARY_FALLBACK_FOOTPRINTS.
+    Returns "" when nothing can be resolved.
+    """
+    from kicad_library import get_footprint
+
+    if explicit:
+        if get_footprint(index, explicit) is None:
+            raise ValueError(f"unknown library footprint: {explicit}")
+        return explicit
+    default_footprint = str((symbol_entry or {}).get("default_footprint") or "").strip()
+    if default_footprint:
+        return default_footprint
+    fallback = LIBRARY_FALLBACK_FOOTPRINTS.get(str((symbol_entry or {}).get("id") or ""), "")
+    if fallback and get_footprint(index, fallback) is not None:
+        return fallback
+    return ""
+
+
+# KiCad pin orientation (direction the lead points into the symbol body)
+# mapped onto the BLOCK side the pin belongs to.
+_KICAD_PIN_SIDE = {"R": "left", "L": "right", "U": "bottom", "D": "top"}
+
+
+def _pin_number_sort_key(number: str) -> tuple[int, Any]:
+    return (0, int(number)) if number.isdigit() else (1, number)
+
+
+def library_block_layout(
+    symbol_pins: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    """Distribute KiCad symbol pins over BLOCK sides and derive body geometry.
+
+    Returns ({pin_number: {"side", "order"}}, {"width", "height"}).  Order 0
+    renders at the top (left/right sides) or left (top/bottom sides), matching
+    the schematic document's block layout, so the block roughly mirrors the
+    KiCad symbol shape.
+    """
+    side_by_number: dict[str, str] = {}
+    for pin in symbol_pins:
+        number = str(pin.get("number", ""))
+        side = _KICAD_PIN_SIDE.get(str(pin.get("orientation", "")).upper())
+        if side is None:
+            side = "left" if float(pin.get("x", 0.0) or 0.0) < 0 else "right"
+        side_by_number[number] = side
+    layout: dict[str, dict[str, Any]] = {}
+    counts = {"left": 0, "right": 0, "top": 0, "bottom": 0}
+    for side in ("left", "right", "top", "bottom"):
+        members = [pin for pin in symbol_pins if side_by_number[str(pin.get("number", ""))] == side]
+        counts[side] = len(members)
+        if side in ("left", "right"):
+            # KiCad y grows upward; order 0 is the topmost slot.
+            members.sort(key=lambda pin: (-float(pin.get("y", 0.0) or 0.0), _pin_number_sort_key(str(pin.get("number", "")))))
+        else:
+            members.sort(key=lambda pin: (float(pin.get("x", 0.0) or 0.0), _pin_number_sort_key(str(pin.get("number", "")))))
+        for order, pin in enumerate(members):
+            layout[str(pin.get("number", ""))] = {"side": side, "order": order}
+    horizontal = max(counts["top"], counts["bottom"])
+    vertical = max(counts["left"], counts["right"])
+    block = {
+        "width": max(160, min(460, ((horizontal * 40 + 60 + 19) // 20) * 20)),
+        "height": max(120, min(460, ((vertical * 28 + 44 + 19) // 20) * 20)),
+    }
+    return layout, block
+
+
+def place_library_component(
+    project: dict[str, Any],
+    modules: dict[str, dict[str, Any]],
+    operation: dict[str, Any],
+) -> str:
+    """Create or update a BLOCK component from the bundled KiCad library."""
+    module_id = str(operation.get("module_id") or "").strip()
+    module = modules.get(module_id)
+    if module is None:
+        raise ValueError(f"unknown module: {module_id}")
+    kind = normalize_project_kind(project.get("project_kind") or DEFAULT_PROJECT_KIND)
+    if kind != "pcb_schematic":
+        raise ValueError(
+            f"place_library_component requires project_kind=pcb_schematic (got {kind})"
+        )
+    name = str(operation.get("name") or "").strip()
+    if not name:
+        raise ValueError("place_library_component requires a component name")
+    value = str(operation.get("value") or "").strip()
+    symbol_id = str(operation.get("symbol") or "").strip()
+    if not symbol_id:
+        raise ValueError("place_library_component requires a symbol (Lib:Name)")
+    from kicad_library import get_symbol
+
+    index = kicad_library_index()
+    symbol_entry = get_symbol(index, symbol_id)
+    if symbol_entry is None:
+        raise ValueError(f"unknown library symbol: {symbol_id}")
+    symbol_pins = symbol_entry.get("pins") or []
+    if not symbol_pins:
+        raise ValueError(f"library symbol has no pins: {symbol_id}")
+    expected_numbers = [str(pin.get("number", "")) for pin in symbol_pins]
+    pin_nets = operation.get("pin_nets")
+    if not isinstance(pin_nets, dict):
+        raise ValueError("place_library_component requires pin_nets (object keyed by pin number)")
+    given = {str(key): str(net).strip() for key, net in pin_nets.items()}
+    expected_set = set(expected_numbers)
+    missing = [number for number in expected_numbers if number not in given]
+    unknown = sorted(set(given) - expected_set, key=_pin_number_sort_key)
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append("missing pins: " + ", ".join(missing))
+        if unknown:
+            details.append("unknown pins: " + ", ".join(unknown))
+        raise ValueError(
+            f"pin_nets must cover exactly the {len(expected_numbers)} pins of "
+            f"{symbol_id} ({'; '.join(details)})"
+        )
+    empty = sorted((number for number, net in given.items() if not net), key=_pin_number_sort_key)
+    if empty:
+        raise ValueError(f"pin_nets has empty net names for pins: {', '.join(empty)}")
+    footprint = resolve_library_footprint(
+        index, symbol_entry, str(operation.get("footprint") or "").strip()
+    )
+    if not footprint:
+        raise ValueError(
+            f"no footprint available for {symbol_id}; pass an explicit footprint "
+            "from the bundled library"
+        )
+    component_type = LIBRARY_PRIMITIVE_TYPES.get(symbol_id, "BLOCK")
+    if component_type == "BLOCK":
+        layout, block = library_block_layout(symbol_pins)
+        pins = []
+        for pin in symbol_pins:
+            number = str(pin.get("number", ""))
+            pin_name = str(pin.get("name", "")).strip()
+            pins.append({
+                "id": number,
+                "name": pin_name if pin_name not in {"", "~"} else number,
+                "net": given[number],
+                "side": layout[number]["side"],
+                "order": layout[number]["order"],
+            })
+    else:
+        block = None
+        # Native primitive: keep the netlist pin idiom (a/b with the display
+        # names from EDITABLE_PIN_NAMES) so renderers, ERC, and compile treat
+        # the part exactly like a netlist-created R/C/D.
+        number_by_pin_id = {
+            pin_id: number for number, pin_id in LIBRARY_PRIMITIVE_PIN_ROLES[component_type].items()
+        }
+        pins = [
+            {
+                "id": pin_id,
+                "name": display_name,
+                "net": given[number_by_pin_id[pin_id]],
+            }
+            for pin_id, display_name in EDITABLE_PIN_NAMES[component_type]
+        ]
+    position = operation.get("position")
+    if isinstance(position, dict) and "x" in position and "y" in position:
+        position = {"x": float(position["x"]), "y": float(position["y"])}
+    else:
+        position = None
+    eda_fields = {"symbol": symbol_id, "footprint": footprint, "refdes": name, "library": "kicad"}
+    slug_base = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_")
+    components = module.setdefault("components", [])
+    existing = next(
+        (
+            component
+            for component in components
+            if str(component.get("name", "")).casefold() == name.casefold()
+            or (slug_base and str(component.get("id", "")) == slug_base)
+        ),
+        None,
+    )
+    if existing is None:
+        used_ids = {str(component.get("id", "")) for component in components}
+        slot = len(components)
+        component = {
+            "id": editable_component_id(name, used_ids),
+            "type": component_type,
+            "name": name,
+            "value": value,
+            "position": position or (
+                {
+                    "x": 160.0 + (slot % 3) * 260.0,
+                    "y": 160.0 + (slot // 3) * 260.0,
+                }
+                if block is not None
+                else {
+                    # Same auto-grid as parse_editable_netlist_components.
+                    "x": 140.0 + (slot % 4) * 180.0,
+                    "y": 120.0 + (slot // 4) * 140.0,
+                }
+            ),
+            # parse_editable_netlist_components default for R/C/D.
+            "rotation": 0,
+            "pins": pins,
+            "eda": eda_fields,
+        }
+        if block is not None:
+            component["block"] = block
+        components.append(component)
+    else:
+        existing["type"] = component_type
+        existing["name"] = name
+        existing["value"] = value
+        if block is not None:
+            existing["block"] = block
+        else:
+            existing.pop("block", None)
+        existing["pins"] = pins
+        previous_eda = existing.get("eda") if isinstance(existing.get("eda"), dict) else {}
+        existing["eda"] = {**previous_eda, **eda_fields}
+        if position is not None:
+            existing["position"] = position
+    return module_id
 
 
 def apply_operation(
@@ -2576,6 +2853,7 @@ def apply_operation(
     module_id_for_guard = str(operation.get("module_id") or "").strip()
     externally_locked_ops = {
         "add_component",
+        "place_library_component",
         "remove_component",
         "add_port",
         "set_component_value",
@@ -2649,6 +2927,9 @@ def apply_operation(
             raise ValueError(f"component already exists: {component.get('id')}")
         module["components"].append(component)
         changed_modules.add(module_id)
+        return
+    if op == "place_library_component":
+        changed_modules.add(place_library_component(project, modules, operation))
         return
     if op == "remove_component":
         module_id = operation["module_id"]
@@ -7291,6 +7572,8 @@ def agent_context(root: Path) -> dict[str, Any]:
     ]
     if supports_lcsc_binding(kind):
         allowed_operations.append("bind_lcsc_part")
+    if supports_eda_bridge(kind):
+        allowed_operations.append("place_library_component")
     if supports_analog_ic_profile(kind):
         allowed_operations.append("set_analog_ic_profile")
     return {
@@ -7707,8 +7990,20 @@ def _slugify_module_id(value: str) -> str:
 
 def pcb_export_readiness(project: dict[str, Any], modules: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Check whether a pcb_schematic project is ready for an EDA handoff."""
+    from kicad_library import get_footprint, get_symbol
+
     missing_lcsc: list[dict[str, str]] = []
     missing_refdes: list[dict[str, str]] = []
+    missing_symbol: list[dict[str, str]] = []
+    missing_footprint: list[dict[str, str]] = []
+    unknown_library_part: list[dict[str, str]] = []
+    try:
+        index = kicad_library_index()
+    except Exception:
+        # Library unavailable: skip symbol/footprint resolution rather than
+        # flag every component as unknown.
+        index = None
+    physical_types = {"R", "C", "L", "D", "Q", "M", "U", "BLOCK", "X"}
     for module_id, module in modules.items():
         for component in module.get("components", []) or []:
             if not isinstance(component, dict):
@@ -7717,25 +8012,57 @@ def pcb_export_readiness(project: dict[str, Any], modules: dict[str, dict[str, A
             if component_type in {"V", "I"} and component.get("mount_policy") != "design_include":
                 continue
             eda = component.get("eda") if isinstance(component.get("eda"), dict) else {}
-            if not str(eda.get("lcsc_id") or "").strip() and component_type in {
-                "R", "C", "L", "D", "Q", "M", "U", "BLOCK", "X",
-            }:
-                missing_lcsc.append({"module_id": module_id, "component_id": str(component.get("id", ""))})
+            entry = {"module_id": module_id, "component_id": str(component.get("id", ""))}
+            if not str(eda.get("lcsc_id") or "").strip() and component_type in physical_types:
+                missing_lcsc.append(entry)
             if not str(eda.get("refdes") or component.get("name") or "").strip():
-                missing_refdes.append({"module_id": module_id, "component_id": str(component.get("id", ""))})
-    ready = not missing_lcsc and not missing_refdes
+                missing_refdes.append(entry)
+            if index is None:
+                continue
+            if component_type not in physical_types or component.get("mount_policy") == "testbench_exclude":
+                continue
+            symbol_id = str(eda.get("symbol") or "").strip()
+            symbol_entry = None
+            if not symbol_id:
+                missing_symbol.append(entry)
+            else:
+                symbol_entry = get_symbol(index, symbol_id)
+                if symbol_entry is None:
+                    unknown_library_part.append({**entry, "symbol": symbol_id})
+            footprint = str(eda.get("footprint") or "").strip()
+            resolved_footprint = footprint or (
+                resolve_library_footprint(index, symbol_entry) if symbol_entry is not None else ""
+            )
+            if not resolved_footprint:
+                missing_footprint.append(entry)
+            elif footprint and get_footprint(index, footprint) is None:
+                unknown_library_part.append({**entry, "footprint": footprint})
+    ready = not (
+        missing_lcsc or missing_refdes or missing_symbol or missing_footprint or unknown_library_part
+    )
+    hints: list[str] = []
+    if missing_lcsc or missing_refdes:
+        hints.extend([
+            "Bind LCSC parts (eda.lcsc_id) for physical components before bridge push.",
+            "Ensure each exportable component has a refdes/name.",
+        ])
+    if missing_symbol or missing_footprint:
+        hints.append(
+            "Place physical components from the bundled KiCad library "
+            "(place_library_component) or set eda.symbol/eda.footprint."
+        )
+    if unknown_library_part:
+        hints.append(
+            "eda.symbol/eda.footprint must resolve against the bundled KiCad library index."
+        )
     return {
         "ready": ready,
         "missing_lcsc_id": missing_lcsc,
         "missing_refdes": missing_refdes,
-        "hints": (
-            []
-            if ready
-            else [
-                "Bind LCSC parts (eda.lcsc_id) for physical components before bridge push.",
-                "Ensure each exportable component has a refdes/name.",
-            ]
-        ),
+        "missing_symbol": missing_symbol,
+        "missing_footprint": missing_footprint,
+        "unknown_library_part": unknown_library_part,
+        "hints": hints,
     }
 
 
@@ -8596,6 +8923,22 @@ def build_parser() -> argparse.ArgumentParser:
     lcsc_bind_parser.add_argument("--api-secret", default=os.environ.get("ACTOVIQ_LCSC_API_SECRET", ""))
     lcsc_bind_parser.add_argument("--use-fallback", action="store_true")
 
+    kicad_lib_search = subparsers.add_parser(
+        "kicad-lib-search", help="Search bundled KiCad symbol library."
+    )
+    kicad_lib_search.add_argument("--query", required=True)
+    kicad_lib_search.add_argument("--limit", type=int, default=10)
+
+    kicad_lib_get = subparsers.add_parser(
+        "kicad-lib-get", help="Fetch one bundled KiCad symbol or footprint."
+    )
+    kicad_lib_get.add_argument("--symbol", default="")
+    kicad_lib_get.add_argument("--footprint", default="")
+
+    subparsers.add_parser(
+        "kicad-lib-reindex", help="Force rebuild of the KiCad library index cache."
+    )
+
     # M2-06: module soft lease commands. UI semantics, not a file lock.
     lease_acquire = subparsers.add_parser(
         "module-lease-acquire", help="Acquire or renew a soft lease on a module."
@@ -9249,6 +9592,48 @@ def main() -> int:
                 api_secret=args.api_secret,
                 use_fallback=bool(args.use_fallback),
             )
+        elif args.command == "kicad-lib-search":
+            from kicad_library import load_index, resolve_lib_root, search_symbols
+
+            index = load_index(resolve_lib_root())
+            results = [
+                {
+                    "id": entry["id"],
+                    "lib": entry["lib"],
+                    "name": entry["name"],
+                    "description": entry.get("description", ""),
+                    "default_footprint": entry.get("default_footprint", ""),
+                    "pin_count": len(entry.get("pins", [])),
+                }
+                for entry in search_symbols(index, args.query, limit=args.limit)
+            ]
+            result = {"ok": True, "results": results}
+        elif args.command == "kicad-lib-get":
+            from kicad_library import get_footprint, get_symbol, load_index, resolve_lib_root
+
+            if bool(args.symbol) == bool(args.footprint):
+                raise ValueError("pass exactly one of --symbol or --footprint")
+            index = load_index(resolve_lib_root())
+            if args.symbol:
+                symbol = get_symbol(index, args.symbol)
+                if symbol is None:
+                    raise ValueError(f"symbol not found: {args.symbol}")
+                result = {"ok": True, "symbol": symbol}
+            else:
+                footprint = get_footprint(index, args.footprint)
+                if footprint is None:
+                    raise ValueError(f"footprint not found: {args.footprint}")
+                result = {"ok": True, "footprint": footprint}
+        elif args.command == "kicad-lib-reindex":
+            from kicad_library import load_index, resolve_lib_root
+
+            index = load_index(resolve_lib_root(), force=True)
+            result = {
+                "ok": True,
+                "symbols": len(index["symbols"]),
+                "footprints": len(index["footprints"]),
+                "cache_path": index["cache_path"],
+            }
         else:
             raise ValueError(f"unknown command: {args.command}")
         print(json.dumps(result, ensure_ascii=False))
