@@ -2746,23 +2746,44 @@ def place_library_component(
     if existing is None:
         used_ids = {str(component.get("id", "")) for component in components}
         slot = len(components)
+        if position is None:
+            # The BLOCK and primitive auto-grids use different origins and
+            # spacings, so their slots can coincide (and any grid slot can
+            # collide with an explicitly positioned part).  Advance to the
+            # first slot that keeps clearance from everything already placed.
+            occupied = [
+                (float(placed["position"]["x"]), float(placed["position"]["y"]))
+                for placed in components
+                if isinstance(placed.get("position"), dict)
+                and isinstance(placed["position"].get("x"), (int, float))
+                and isinstance(placed["position"].get("y"), (int, float))
+            ]
+            while True:
+                candidate = (
+                    {
+                        "x": 160.0 + (slot % 3) * 260.0,
+                        "y": 160.0 + (slot // 3) * 260.0,
+                    }
+                    if block is not None
+                    else {
+                        # Same auto-grid as parse_editable_netlist_components.
+                        "x": 140.0 + (slot % 4) * 180.0,
+                        "y": 120.0 + (slot // 4) * 140.0,
+                    }
+                )
+                if all(
+                    abs(candidate["x"] - occupied_x) >= 80.0 or abs(candidate["y"] - occupied_y) >= 80.0
+                    for occupied_x, occupied_y in occupied
+                ):
+                    position = candidate
+                    break
+                slot += 1
         component = {
             "id": editable_component_id(name, used_ids),
             "type": component_type,
             "name": name,
             "value": value,
-            "position": position or (
-                {
-                    "x": 160.0 + (slot % 3) * 260.0,
-                    "y": 160.0 + (slot // 3) * 260.0,
-                }
-                if block is not None
-                else {
-                    # Same auto-grid as parse_editable_netlist_components.
-                    "x": 140.0 + (slot % 4) * 180.0,
-                    "y": 120.0 + (slot // 4) * 140.0,
-                }
-            ),
+            "position": position,
             # parse_editable_netlist_components default for R/C/D.
             "rotation": 0,
             "pins": pins,

@@ -2422,6 +2422,200 @@ def _module_prefers_label_routing(module: dict[str, Any], components: list[dict[
     return max(fanout.values(), default=0) > LABEL_MODE_MAX_FANOUT
 
 
+def _label_effective_bounds(component: dict[str, Any]) -> dict[str, float]:
+    """Placement bounds for label-mode candidates.
+
+    Generated glyphs use the generic box; components carrying a real library
+    symbol also cover the rotated library pin extents, because the exported
+    instance is that symbol rather than the generic box.
+    """
+
+    bounds = _component_bounds(component)
+    eda = component.get("eda") if isinstance(component.get("eda"), dict) else {}
+    eda_symbol = str(eda.get("symbol", "")).strip()
+    if not eda_symbol:
+        return bounds
+    library, separator, cell = eda_symbol.partition(":")
+    if not separator:
+        return bounds
+    try:
+        symbol_pins = symbol_pin_positions(library.strip(), cell.strip())
+    except ValueError:
+        return bounds
+    if not symbol_pins:
+        return bounds
+    position = component.get("position") or {}
+    rotation = int(round(float(component.get("rotation", 0)))) % 360
+    xs: list[float] = []
+    ys: list[float] = []
+    for x_mm, y_mm, _angle in symbol_pins.values():
+        dx, dy = _rotate_point(x_mm / MM_PER_UNIT, -y_mm / MM_PER_UNIT, rotation)
+        xs.append(float(position.get("x", 0)) + dx)
+        ys.append(float(position.get("y", 0)) + dy)
+    margin = 2 * GRID
+    return {
+        "min_x": min(bounds["min_x"], min(xs) - margin),
+        "min_y": min(bounds["min_y"], min(ys) - margin),
+        "max_x": max(bounds["max_x"], max(xs) + margin),
+        "max_y": max(bounds["max_y"], max(ys) + margin),
+    }
+
+
+def _bounds_overlap(left: dict[str, float], right: dict[str, float]) -> bool:
+    return (
+        left["min_x"] < right["max_x"] and left["max_x"] > right["min_x"]
+        and left["min_y"] < right["max_y"] and left["max_y"] > right["min_y"]
+    )
+
+
+def _bounds_shape(component: dict[str, Any]) -> tuple[float, float, float, float]:
+    """Return (width, height, center_dx, center_dy) relative to the position."""
+
+    bounds = _label_effective_bounds(component)
+    position = component.get("position") or {}
+    return (
+        bounds["max_x"] - bounds["min_x"],
+        bounds["max_y"] - bounds["min_y"],
+        (bounds["min_x"] + bounds["max_x"]) / 2 - float(position.get("x", 0)),
+        (bounds["min_y"] + bounds["max_y"]) / 2 - float(position.get("y", 0)),
+    )
+
+
+def _deoverlap_label_candidate(components: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Keep source positions and shift only overlapping components.
+
+    Auto-grid placement can assign identical coordinates to two components;
+    rather than discarding the whole source layout for a lane candidate, move
+    each colliding component to the nearest free grid slot (deterministic ring
+    search, closest first).  Returns ``None`` when nothing overlaps.
+    """
+
+    candidate = json.loads(json.dumps(components))
+    placed: list[dict[str, float]] = []
+    moved = False
+    for component in candidate:
+        width, height, center_dx, center_dy = _bounds_shape(component)
+        position = component.setdefault("position", {"x": 0.0, "y": 0.0})
+        bounds = {
+            "min_x": float(position.get("x", 0)) + center_dx - width / 2,
+            "max_x": float(position.get("x", 0)) + center_dx + width / 2,
+            "min_y": float(position.get("y", 0)) + center_dy - height / 2,
+            "max_y": float(position.get("y", 0)) + center_dy + height / 2,
+        }
+        if not any(_bounds_overlap(bounds, other) for other in placed):
+            placed.append(bounds)
+            continue
+        moved = True
+        origin_x = _snap(float(position.get("x", 0)))
+        origin_y = _snap(float(position.get("y", 0)))
+        offsets = sorted(
+            (
+                (dx, dy)
+                for radius in range(1, 25)
+                for dx in range(-radius, radius + 1)
+                for dy in range(-radius, radius + 1)
+                if max(abs(dx), abs(dy)) == radius
+            ),
+            key=lambda item: (max(abs(item[0]), abs(item[1])), item[0], item[1]),
+        )
+        chosen: dict[str, float] | None = None
+        for dx, dy in offsets:
+            trial_bounds = {
+                "min_x": origin_x + dx * GRID + center_dx - width / 2,
+                "max_x": origin_x + dx * GRID + center_dx + width / 2,
+                "min_y": origin_y + dy * GRID + center_dy - height / 2,
+                "max_y": origin_y + dy * GRID + center_dy + height / 2,
+            }
+            if any(_bounds_overlap(trial_bounds, other) for other in placed):
+                continue
+            position["x"], position["y"] = origin_x + dx * GRID, origin_y + dy * GRID
+            chosen = trial_bounds
+            break
+        if chosen is None:
+            return None
+        placed.append(chosen)
+    return candidate if moved else None
+
+
+def _compact_label_candidate(components: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Arrange components into a compact multi-column grid.
+
+    Deterministic order: the largest pin-count component first, then greedily
+    by connectivity adjacency to already-placed components.  The column count
+    targets a landscape-ish bounding box instead of one tall column.
+    """
+
+    if not components:
+        return None
+    candidate = json.loads(json.dumps(components))
+    nets_by_component = {
+        str(component.get("id", "")): {
+            str(pin.get("net_id") or pin.get("net") or "")
+            for pin in component.get("pins", [])
+        }
+        for component in candidate
+    }
+    remaining = {str(component.get("id", "")): component for component in candidate}
+    order: list[dict[str, Any]] = []
+    placed_ids: set[str] = set()
+    while remaining:
+        def rank(entry: dict[str, Any]) -> tuple[int, int, str]:
+            nets = nets_by_component.get(str(entry.get("id", "")), set())
+            adjacency = sum(1 for other in placed_ids if nets & nets_by_component.get(other, set()))
+            return (-adjacency, -len(entry.get("pins", [])), str(entry.get("id", "")))
+
+        chosen = min(remaining.values(), key=rank)
+        chosen_id = str(chosen.get("id", ""))
+        order.append(chosen)
+        placed_ids.add(chosen_id)
+        remaining.pop(chosen_id)
+    columns = max(1, math.ceil(math.sqrt(len(order) * 1.4)))
+    gap = 8 * GRID
+    cursor_y = 0.0
+    for row_start in range(0, len(order), columns):
+        row = order[row_start:row_start + columns]
+        row_height = 0.0
+        cursor_x = 0.0
+        for component in row:
+            width, height, center_dx, center_dy = _bounds_shape(component)
+            component["position"] = {
+                "x": _snap(cursor_x + width / 2 - center_dx),
+                "y": _snap(cursor_y + height / 2 - center_dy),
+            }
+            cursor_x += width + gap
+            row_height = max(row_height, height)
+        cursor_y += row_height + gap
+    return candidate
+
+
+def _label_candidate_order(candidates: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    """Order label-mode candidates: de-overlapped source, compact grid, source, lanes."""
+
+    if not candidates:
+        return []
+    ordered: list[list[dict[str, Any]]] = []
+    seen: set[bytes] = set()
+
+    def offer(candidate: list[dict[str, Any]] | None) -> None:
+        if candidate is None:
+            return
+        key = _canonical_json(candidate)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(candidate)
+
+    source = candidates[0]
+    # Overlapping source placements are perturbed minimally first; the raw
+    # source remains as a later fallback in case the perturbation breaks stub
+    # placement somewhere unexpected.
+    offer(_deoverlap_label_candidate(source) or source)
+    offer(_compact_label_candidate(source))
+    offer(source)
+    for candidate in candidates[1:]:
+        offer(candidate)
+    return ordered
+
+
 def _first_label_layout_candidate(
     module_id: str,
     module: dict[str, Any],
@@ -2432,13 +2626,14 @@ def _first_label_layout_candidate(
 
     Source placements may stack two library-symbol components so their real
     pins coincide (auto-grid collisions); a straight label stub from such a
-    point contacts the foreign pin at every direction and length.  Trying the
-    deterministic candidate list in order keeps the source layout when it
-    works and falls back to the lane-based variants when it does not.
+    point contacts the foreign pin at every direction and length.  The
+    candidate order keeps the source layout first, then a minimally perturbed
+    de-overlapped source, then a compact grid, and only then the lane-based
+    variants, so aesthetics survive whenever stub placement still succeeds.
     """
 
     failures: list[str] = []
-    for components in candidates:
+    for components in _label_candidate_order(candidates):
         try:
             return _label_layout_candidate(module_id, module, components, source_connectivity_hash)
         except ValueError as error:
@@ -3599,6 +3794,98 @@ def _kicad_page_paper(page: dict[str, Any], offset_x: float, offset_y: float) ->
     )
 
 
+_KICAD_TEXT_HEIGHT_UNITS = 15.0  # ~1.9 mm conservative block height for the 1.27 mm font
+_KICAD_CHAR_WIDTH_UNITS = 10.0   # 1.27 mm per character, conservative
+
+
+def _kicad_property_axis(component: dict[str, Any]) -> tuple[float, float, bool]:
+    """Half extents (hx, hy) for property anchoring and whether pins run vertically."""
+
+    eda = component.get("eda") if isinstance(component.get("eda"), dict) else {}
+    eda_symbol = str(eda.get("symbol", "")).strip()
+    if eda_symbol:
+        library, separator, cell = eda_symbol.partition(":")
+        if separator:
+            try:
+                symbol_pins = symbol_pin_positions(library.strip(), cell.strip())
+            except ValueError:
+                symbol_pins = {}
+            if symbol_pins:
+                rotation = int(round(float(component.get("rotation", 0)))) % 360
+                offsets = [
+                    _rotate_point(x_mm / MM_PER_UNIT, -y_mm / MM_PER_UNIT, rotation)
+                    for x_mm, y_mm, _angle in symbol_pins.values()
+                ]
+                xs = [dx for dx, _dy in offsets]
+                ys = [dy for _dx, dy in offsets]
+                spread_x = max(xs) - min(xs)
+                spread_y = max(ys) - min(ys)
+                hx = max(abs(value) for value in xs) + GRID
+                hy = max(abs(value) for value in ys) + GRID
+                return hx, hy, spread_y > spread_x
+    width, height = _component_size(component)
+    return width / 2, height / 2, int(component.get("rotation", 0)) % 180 == 90
+
+
+def _kicad_text_block(center_x: float, center_y: float, justify: str | None, width_units: float) -> dict[str, float]:
+    if justify == "left":
+        min_x, max_x = center_x, center_x + width_units
+    elif justify == "right":
+        min_x, max_x = center_x - width_units, center_x
+    else:
+        min_x, max_x = center_x - width_units / 2, center_x + width_units / 2
+    half = _KICAD_TEXT_HEIGHT_UNITS / 2
+    return {"min_x": min_x, "max_x": max_x, "min_y": center_y - half, "max_y": center_y + half}
+
+
+def _kicad_property_layouts(components: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
+    """Deterministic Reference/Value placements that avoid text collisions.
+
+    Anchors start beside the effective body (real library symbol extents when
+    the component carries ``eda.symbol``, generic glyph size otherwise) and
+    off the pin axis, so net-label stubs on that axis stay clear of the text.
+    Remaining collisions with already accepted text blocks are resolved by
+    trying the opposite side, then extra outward offsets, in a fixed order.
+    """
+
+    layouts: dict[str, dict[str, dict[str, Any]]] = {}
+    accepted: list[dict[str, float]] = []
+    for component in sorted(components, key=lambda item: str(item.get("id", ""))):
+        eda = component.get("eda") or {}
+        refdes = str(eda.get("refdes", component.get("name", "")))
+        value = str(component.get("value", ""))
+        hx, hy, vertical = _kicad_property_axis(component)
+        position = component.get("position") or {}
+        cx = _kicad_snap_internal(float(position.get("x", 0)))
+        cy = _kicad_snap_internal(float(position.get("y", 0)))
+        placement: dict[str, dict[str, Any]] = {}
+        for prop, text in (("reference", refdes), ("value", value)):
+            width_units = max(6 if prop == "reference" else 8, len(text)) * _KICAD_CHAR_WIDTH_UNITS
+            if vertical:
+                near = [((-hx - 20, 0.0), "right"), ((hx + 20, 0.0), "left")]
+                far = [((-hx - 40, 0.0), "right"), ((hx + 40, 0.0), "left")]
+                cross = [((0.0, -hy - 20), None), ((0.0, hy + 20), None)]
+            else:
+                near = [((0.0, -hy - 20), None), ((0.0, hy + 20), None)]
+                far = [((0.0, -hy - 40), None), ((0.0, hy + 40), None)]
+                cross = [((-hx - 20, 0.0), "right"), ((hx + 20, 0.0), "left")]
+            if prop == "reference":
+                sequence = [near[0], near[1], far[0], far[1], cross[0], cross[1]]
+            else:
+                sequence = [near[1], near[0], far[1], far[0], cross[1], cross[0]]
+            chosen = sequence[0]
+            for rel, justify in sequence:
+                block = _kicad_text_block(cx + rel[0], cy + rel[1], justify, width_units)
+                if not any(_bounds_overlap(block, other) for other in accepted):
+                    chosen = (rel, justify)
+                    break
+            rel, justify = chosen
+            accepted.append(_kicad_text_block(cx + rel[0], cy + rel[1], justify, width_units))
+            placement[prop] = {"rel": rel, "justify": justify}
+        layouts[str(component.get("id", ""))] = placement
+    return layouts
+
+
 def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: list[dict[str, Any]], symbol_map: dict[str, Any], *, root_page: bool) -> list[str]:
     page_uuid = _stable_uuid(project_name, page["id"])
     offset_x, offset_y = _kicad_page_offset(page)
@@ -3728,6 +4015,7 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
                 f"(fields_autoplaced yes) (effects (font (size 1.27 1.27)) (justify {justify})) "
                 f"(uuid {_stable_uuid(page['id'], net_id, 'label', endpoint.get('component_id', ''), endpoint.get('pin_id', ''))}))"
             )
+    property_layouts = _kicad_property_layouts(page["components"])
     for component in page["components"]:
         position = component["position"]
         binding = binding_for(symbol_map, "kicad", page["id"], component)
@@ -3736,19 +4024,22 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
         physical = bool(eda.get("physical", str(component.get("type", "")).upper() in {"R", "C", "L", "D", "M", "Q"}))
         refdes = str(eda.get("refdes", component["name"]))
         kicad_rotation = (-int(component.get("rotation", 0))) % 360
-        width, height = _component_size(component)
         component_x = _kicad_snap_internal(float(position["x"]) + offset_x)
         component_y = _kicad_snap_internal(float(position["y"]) + offset_y)
-        if int(component.get("rotation", 0)) % 180 == 90:
-            reference_at = ((component_x - width / 2 - 20) * MM_PER_UNIT, component_y * MM_PER_UNIT)
-            value_at = ((component_x + width / 2 + 20) * MM_PER_UNIT, component_y * MM_PER_UNIT)
-        else:
-            reference_at = (component_x * MM_PER_UNIT, (component_y - height / 2 - 20) * MM_PER_UNIT)
-            value_at = (component_x * MM_PER_UNIT, (component_y + height / 2 + 20) * MM_PER_UNIT)
+        layout = property_layouts[str(component.get("id", ""))]
+
+        def property_at(prop: str) -> tuple[tuple[float, float], str]:
+            rel = layout[prop]["rel"]
+            justify = layout[prop]["justify"]
+            effects = f"(effects (font (size 1.27 1.27)){f' (justify {justify})' if justify else ''})"
+            return ((component_x + rel[0]) * MM_PER_UNIT, (component_y + rel[1]) * MM_PER_UNIT), effects
+
+        reference_at, reference_effects = property_at("reference")
+        value_at, value_effects = property_at("value")
         lines.extend([
             f"  (symbol (lib_id {_sexpr_string(lib_id)}) (at {component_x*MM_PER_UNIT:.4f} {component_y*MM_PER_UNIT:.4f} {kicad_rotation}) (unit 1) (exclude_from_sim no) (in_bom {'yes' if physical else 'no'}) (on_board {'yes' if physical else 'no'}) (dnp no) (uuid {_stable_uuid(page['id'], component['id'])})",
-            f"    (property \"Reference\" {_sexpr_string(refdes)} (at {reference_at[0]:.4f} {reference_at[1]:.4f} 0) (effects (font (size 1.27 1.27))))",
-            f"    (property \"Value\" {_sexpr_string(component.get('value', ''))} (at {value_at[0]:.4f} {value_at[1]:.4f} 0) (effects (font (size 1.27 1.27))))",
+            f"    (property \"Reference\" {_sexpr_string(refdes)} (at {reference_at[0]:.4f} {reference_at[1]:.4f} 0) {reference_effects})",
+            f"    (property \"Value\" {_sexpr_string(component.get('value', ''))} (at {value_at[0]:.4f} {value_at[1]:.4f} 0) {value_effects})",
             f"    (property \"ACTOVIQ_ID\" {_sexpr_string(str(component.get('stable_id') or component['id']))} (at 0 0 0) (effects (font (size 1.27 1.27)) hide))",
             f"    (property \"ACTOVIQ_PAGE_ID\" {_sexpr_string(page['id'])} (at 0 0 0) (effects (font (size 1.27 1.27)) hide))",
             f"    (property \"ACTOVIQ_NAME\" {_sexpr_string(component['name'])} (at 0 0 0) (effects (font (size 1.27 1.27)) hide))",

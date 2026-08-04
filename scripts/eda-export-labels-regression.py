@@ -28,6 +28,8 @@ sys.path.insert(0, str(REPO / "skills" / "circuit-design-ngspice" / "scripts"))
 
 from eda_export import (  # noqa: E402
     SYMBOL_MAP_SCHEMA,
+    _bounds_overlap,
+    _label_effective_bounds,
     _label_route_module,
     _write_kicad,
     build_eda_ir,
@@ -186,6 +188,146 @@ def run_export(output: Path, project: dict, modules: dict, *, scope: str = "modu
     )
 
 
+def text_block_collisions(schematic: str) -> list[tuple[str, str, str, str]]:
+    """Conservative Reference/Value text-block intersection check.
+
+    Blocks assume ref ~6 chars / value ~8 chars at 1.27 mm width and 1.9 mm
+    height, expanded by the same justify rules the writer emits.  Only blocks
+    of different components count.
+    """
+
+    blocks: list[tuple[str, str, float, float, float, float]] = []
+    for match in re.finditer(r"  \(symbol \(lib_id ", schematic):
+        start = match.start()
+        depth = 0
+        end = start
+        for index, character in enumerate(schematic[start:], start):
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        block = schematic[start:end]
+        owner = re.search(r'\(property "Reference" "([^"]*)"', block)
+        for prop in ("Reference", "Value"):
+            prop_match = re.search(
+                r'\(property "%s" "([^"]*)" \(at ([-\d.]+) ([-\d.]+)[^)]*\) \(effects([^)]*(?:\)[^)]*)?)\)' % prop,
+                block,
+            )
+            if not prop_match:
+                continue
+            text = prop_match.group(1)
+            x, y = float(prop_match.group(2)), float(prop_match.group(3))
+            effects = prop_match.group(4)
+            justify = "left" if "justify left" in effects else "right" if "justify right" in effects else None
+            width = max(6 if prop == "Reference" else 8, len(text)) * 1.27
+            height = 1.9
+            if justify == "left":
+                span = (x, x + width)
+            elif justify == "right":
+                span = (x - width, x)
+            else:
+                span = (x - width / 2, x + width / 2)
+            blocks.append((owner.group(1) if owner else "?", prop, span[0], y - height / 2, span[1], y + height / 2))
+    collisions = []
+    for index, left in enumerate(blocks):
+        for right in blocks[index + 1:]:
+            if left[0] == right[0]:
+                continue
+            if left[2] < right[4] and left[4] > right[2] and left[3] < right[5] and left[5] > right[3]:
+                collisions.append((left[0], left[1], right[0], right[1]))
+    return collisions
+
+
+def assert_no_text_collisions(export_root: Path, context: str) -> None:
+    for schematic in sorted((export_root / "kicad").glob("*.kicad_sch")):
+        collisions = text_block_collisions(schematic.read_text(encoding="utf-8"))
+        assert not collisions, f"{context}: property text blocks collide in {schematic.name}: {collisions[:5]}"
+
+
+def assert_stacked_passives_text(output: Path) -> None:
+    """Vertically stacked library passives must not collide property texts.
+
+    Reproduces the C12/C13-style crowding from the STM32 power_supply sheet:
+    same-orientation real-symbol passives one grid row apart, plus a wide
+    value text on an adjacent IC that used to overlap a neighbour's Reference.
+    """
+
+    module = {
+        "schema": "actoviq.module.v2",
+        "module_id": "passives",
+        "name": "Passives",
+        "revision": 1,
+        "ports": [
+            {"id": "gnd", "name": "GND", "direction": "bidirectional", "signal_type": "ground", "net": "gnd"},
+            {"id": "vin", "name": "VIN", "direction": "input", "signal_type": "power", "net": "vin"},
+        ],
+        "components": [
+            component("c1", "C", "10u", 0, 0, [pin("a", "vin"), pin("b", "gnd")],
+                      eda={"symbol": "Device:C", "footprint": "Capacitor_SMD:C_0603_1608Metric"}),
+            component("c2", "C", "100n", 0, 140, [pin("a", "vin"), pin("b", "gnd")],
+                      eda={"symbol": "Device:C", "footprint": "Capacitor_SMD:C_0603_1608Metric"}),
+            component("r1", "R", "1k", 140, 0, [pin("a", "vin"), pin("b", "gnd")],
+                      eda={"symbol": "Device:R", "footprint": "Resistor_SMD:R_0603_1608Metric"}),
+            component("r2", "R", "10k", 140, 140, [pin("a", "vin"), pin("b", "gnd")],
+                      eda={"symbol": "Device:R", "footprint": "Resistor_SMD:R_0603_1608Metric"}),
+            component(
+                "u1", "BLOCK", "AMS1117-3.3", 320, 60,
+                [pin("1", "gnd"), pin("2", "vout"), pin("3", "vin")],
+                block={"width": 120, "height": 80},
+                eda={"symbol": "Regulator_Linear:AMS1117-3.3", "footprint": "Package_TO_SOT_SMD:SOT-223"},
+            ),
+            component("c3", "C", "10u", 480, 60, [pin("a", "vout"), pin("b", "gnd")],
+                      eda={"symbol": "Device:C", "footprint": "Capacitor_SMD:C_0603_1608Metric"}),
+        ],
+        "nets": [],
+        "wires": [],
+        "annotations": [],
+    }
+    project = {
+        "schema": "actoviq.project.v2",
+        "project_id": "eda-labels-passives",
+        "name": "EDA Labels Passives",
+        "project_kind": "pcb_schematic",
+        "revision": 1,
+        "modules": [
+            {
+                "id": "passives",
+                "name": "Passives",
+                "kind": "circuit",
+                "source": "modules/passives/module.circuit.json",
+                "position": {"x": 0, "y": 0},
+                "size": {"width": 600, "height": 300},
+                "ports": module["ports"],
+            }
+        ],
+        "connections": [],
+    }
+    result = export_eda(
+        output,
+        project,
+        {"passives": module},
+        {"blocking": False, "summary": {"errors": 0}},
+        DOCUMENT_HASH,
+        scope="module",
+        module_id="passives",
+        targets=["kicad"],
+        view="design",
+        mapping_file="",
+        native_convert="auto",
+        strict_layout=False,
+        source_revision=1,
+    )
+    assert result["ok"], f"stacked-passives export failed: {result}"
+    export_root = Path(result["export_root"])
+    assert_no_text_collisions(export_root, "stacked passives")
+    if find_kicad_cli():
+        detail = result["manifest"]["targets"]["kicad"]["detail"]
+        assert detail.get("connectivity_roundtrip") == "passed"
+
+
 def assert_stub_direction_probe() -> None:
     """A pin corridor of foreign stubs must not trap a victim pin's stub.
 
@@ -246,6 +388,7 @@ def assert_project_scope_export(output: Path, project: dict, modules: dict) -> N
     symbol_map = json.loads((export_root / "ir" / "symbol-map.resolved.json").read_text(encoding="utf-8"))
     report = validate_kicad_package(kicad_dir, ir, symbol_map)
     assert report["passed"]
+    assert_no_text_collisions(export_root, "project scope")
     if find_kicad_cli():
         detail = result["manifest"]["targets"]["kicad"]["detail"]
         assert detail.get("connectivity_roundtrip") == "passed", (
@@ -338,9 +481,12 @@ def assert_stacked_components_relocated(output: Path) -> None:
         str(entry["id"]): (float(entry["position"]["x"]), float(entry["position"]["y"]))
         for entry in page["components"]
     }
-    assert positions["r1"] != positions["r2"] and (0.0, 0.0) not in {
-        positions["r1"], positions["r2"]
-    }, f"stacked components must be separated by a fallback lane candidate: {positions}"
+    assert positions["r1"] != positions["r2"], (
+        f"stacked components must be separated: {positions}"
+    )
+    assert (0.0, 0.0) in {positions["r1"], positions["r2"]}, (
+        f"the non-colliding component must keep its source slot (minimal perturbation): {positions}"
+    )
     assert all(net.get("connection") == "label" for net in page["nets"])
     if find_kicad_cli():
         detail = result["manifest"]["targets"]["kicad"]["detail"]
@@ -367,6 +513,27 @@ def assert_label_mode_export(export_root: Path, result: dict) -> None:
     assert pin_endpoints and all(net.get("connection") == "label" for net in page["nets"]), (
         "board-level module must fall into net-label connection mode"
     )
+    # Layout quality: a label-mode page must stay compact and overlap-free,
+    # using placement bounds that include real library symbol extents.
+    component_bounds = {
+        str(entry["id"]): _label_effective_bounds(entry) for entry in page["components"]
+    }
+    bound_ids = sorted(component_bounds)
+    collisions = [
+        (left, right)
+        for index, left in enumerate(bound_ids)
+        for right in bound_ids[index + 1:]
+        if _bounds_overlap(component_bounds[left], component_bounds[right])
+    ]
+    assert not collisions, f"exported page must not overlap components: {collisions}"
+    span_x = max(bounds["max_x"] for bounds in component_bounds.values()) - min(
+        bounds["min_x"] for bounds in component_bounds.values()
+    )
+    span_y = max(bounds["max_y"] for bounds in component_bounds.values()) - min(
+        bounds["min_y"] for bounds in component_bounds.values()
+    )
+    aspect = span_x / span_y if span_y else 1.0
+    assert 0.5 <= aspect <= 3.0, f"exported page bounding box must stay near-landscape, got {aspect:.2f}"
     local_labels = re.findall(r'^\s{2}\(label "([^"]+)"', schematic, re.MULTILINE)
     assert len(local_labels) == len(pin_endpoints), (
         f"expected one local label per pin endpoint ({len(pin_endpoints)}), found {len(local_labels)}"
@@ -467,6 +634,7 @@ def main() -> int:
     first_root = Path(first["export_root"])
     assert first["ok"], f"export failed: {first}"
     assert_label_mode_export(first_root, first)
+    assert_no_text_collisions(first_root, "mcu fixture")
 
     # Determinism: identical inputs must reproduce identical schematics.
     second = run_export(OUTPUT / "second", project, modules)
@@ -486,6 +654,9 @@ def main() -> int:
 
     # Stacked library-symbol components relocate via lane candidates.
     assert_stacked_components_relocated(OUTPUT / "stacked")
+
+    # Stacked same-orientation library passives keep property texts apart.
+    assert_stacked_passives_text(OUTPUT / "passives")
 
     print(json.dumps({"ok": True, "export_root": str(first_root), "kicad_cli": bool(find_kicad_cli())}))
     return 0
