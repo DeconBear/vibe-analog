@@ -59,6 +59,9 @@ export interface SchematicBounds {
   maxY: number;
 }
 
+/** Routing keep-out zone; `net` marks the owning net so its own labels stay routable. */
+type NetRouteObstacle = SchematicBounds & { net?: string };
+
 export interface SchematicNetLabel {
   id: string;
   kind: 'power' | 'ground' | 'signal';
@@ -200,7 +203,7 @@ export function createSchematicDocumentImplementation(
   const portPositions = computePortPositions(next);
   const connectedPortIds = computeConnectedPortIds(next);
   const netLabels = createNetLabels(next, portPositions);
-  const wires = materializeNetWires(next, portPositions);
+  const wires = materializeNetWires(next, portPositions, netLabels);
   // Unconnected ports render dimmed as wire targets, so they also belong to the
   // plot bounds; only rail ports already represented by net-label stubs drop out.
   const visiblePortIds = new Set(
@@ -2564,7 +2567,46 @@ function autoLayoutGenericModule(module: CircuitModule): CircuitModule {
     });
     component.rotation = normalizeRotation(component.rotation);
   });
+  keepBlockPinChannelsClear(module);
   return module;
+}
+
+/**
+ * The naive grid can park discretes inside a block symbol's pin-lead zone,
+ * caging its pins behind padded obstacles. Slide such components right
+ * (deterministically, keeping their row) until they clear the block and
+ * every already-placed neighbour, so a routing channel stays open around
+ * the block's left/right edges.
+ */
+function keepBlockPinChannelsClear(module: CircuitModule): void {
+  const blocks = module.components.filter(isBlockLike);
+  if (blocks.length === 0) return;
+  // The channel beside a block edge carries egress stubs and the signal
+  // ports parked at pin +110; components must clear both.
+  const placed = blocks.map((block) => padBounds(componentBounds(block), SCHEMATIC_GRID + 110));
+  const rectanglesOverlap = (left: SchematicBounds, right: SchematicBounds) => (
+    left.maxX > right.minX && left.minX < right.maxX &&
+    left.maxY > right.minY && left.minY < right.maxY
+  );
+  for (const victim of module.components) {
+    if (isBlockLike(victim)) continue;
+    let bounds = componentBounds(victim);
+    if (!placed.some((other) => rectanglesOverlap(bounds, other))) {
+      placed.push(bounds);
+      continue;
+    }
+    let x = victim.position.x;
+    for (let guard = 0; guard < 40; guard += 1) {
+      const blockers = placed.filter((other) => rectanglesOverlap(bounds, other));
+      if (blockers.length === 0) break;
+      const rightmost = Math.max(...blockers.map((blocker) => blocker.maxX));
+      const halfWidth = (bounds.maxX - bounds.minX) / 2;
+      x = snap(rightmost + SCHEMATIC_GRID + halfWidth);
+      bounds = componentBounds({ ...victim, position: { x, y: victim.position.y } });
+    }
+    victim.position = { x, y: victim.position.y };
+    placed.push(bounds);
+  }
 }
 
 function placeRailBranch(
@@ -3093,7 +3135,8 @@ export function computePortPositions(module: CircuitModule): Map<string, Circuit
     }
     const points = pinPointsByNet.get(port.net) ?? [];
     const activeControlSide = activeControlInputPortSide(module, port);
-    const side = activeControlSide ?? signalPortSide(port, points, bounds);
+    const blockEdgeSide = activeControlSide ? null : blockEdgePortSide(module, port);
+    const side = activeControlSide ?? blockEdgeSide ?? signalPortSide(port, points, bounds);
     const index = signalSideCounts[side];
     signalSideCounts[side] += 1;
     const anchor = side === 'right' ? rightmost(points) : leftmost(points);
@@ -3110,9 +3153,14 @@ export function computePortPositions(module: CircuitModule): Map<string, Circuit
       : base.x - 110;
     const preferredY = differentialOutput
       ? differentialOutputPortPreferredY(port, points, base.y, sideGroupIndex)
-      : activeControlSide ? base.y : base.y + index * 16;
+      // Block-edge fan-out ports track their own pin row; the global
+      // per-side index drift otherwise parks ports far below their pins and
+      // forces wrap-around routes through one congested channel.
+      : activeControlSide || blockEdgeSide ? base.y : base.y + index * 16;
     const snappedX = snap(x);
-    const y = avoidSignalPortY(module, port, snappedX, preferredY, signalSidePositions[side][sideGroup]);
+    const y = blockEdgeSide
+      ? avoidBlockEdgePortY(module, port, snappedX, preferredY, signalSidePositions[side][sideGroup])
+      : avoidSignalPortY(module, port, snappedX, preferredY, signalSidePositions[side][sideGroup]);
     signalSidePositions[side][sideGroup].push({ x: snappedX, y });
     map.set(port.id, snapPoint({
       x,
@@ -3199,6 +3247,41 @@ function portVisibleForNetLabels(netLabels: SchematicNetLabel[], port: CircuitPo
   return !isRailPort || !netLabels.some((label) => label.net === port.net);
 }
 
+/**
+ * Block-like symbols (MCU / module instances) park a signal port beside the
+ * body edge that actually carries the net's pins. The sheet-center heuristic
+ * otherwise drops the port behind a wide block, so every fan-out wire wraps
+ * around the body and converges on one congested vertical channel.
+ */
+function blockEdgePortSide(module: CircuitModule, port: CircuitPort): SignalPortSide | null {
+  let leftPins = 0;
+  let rightPins = 0;
+  for (const component of module.components) {
+    if (!isBlockLike(component)) continue;
+    component.pins.forEach((pin, index) => {
+      if (pin.no_connect || pin.net !== port.net) return;
+      // Block pins carry an explicit edge assignment; only left/right edges
+      // vote. Pins without a side fall back to the horizontal offset sign.
+      if (pin.side === 'right') {
+        rightPins += 1;
+        return;
+      }
+      if (pin.side === 'left') {
+        leftPins += 1;
+        return;
+      }
+      if (pin.side === 'top' || pin.side === 'bottom') return;
+      const point = pinWorld(component, pin, index);
+      const dx = point.x - component.position.x;
+      if (dx > 0) rightPins += 1;
+      else if (dx < 0) leftPins += 1;
+    });
+  }
+  if (rightPins > leftPins) return 'right';
+  if (leftPins > rightPins) return 'left';
+  return null;
+}
+
 function signalPortSide(port: CircuitPort, points: CircuitPosition[], bounds: SchematicBounds): SignalPortSide {
   if (points.length === 0) return port.direction === 'output' ? 'right' : 'left';
   if (port.direction === 'output') return 'right';
@@ -3264,6 +3347,28 @@ function portPositionConflicts(left: CircuitPosition, right: CircuitPosition, mi
   return Math.abs(left.x - right.x) < SCHEMATIC_GRID * 7 && Math.abs(left.y - right.y) < minYGap;
 }
 
+/**
+ * Block fan-out ports hug their own pin row: search outward from the pin's
+ * y in both directions (one-way cascades drift ports hundreds of px away
+ * from their pins and force long wrap-around routes).
+ */
+function avoidBlockEdgePortY(
+  module: CircuitModule,
+  port: CircuitPort,
+  x: number,
+  preferredY: number,
+  usedPositions: CircuitPosition[],
+): number {
+  const minGap = SCHEMATIC_GRID * 2;
+  const offsets = [0, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8, 10, -10, 12, -12].map((step) => step * SCHEMATIC_GRID);
+  for (const offset of offsets) {
+    const y = snap(preferredY + offset);
+    if (usedPositions.some((used) => portPositionConflicts({ x, y }, used, minGap))) continue;
+    if (!signalPortPointBlocked(module, port, { x, y })) return y;
+  }
+  return snap(preferredY);
+}
+
 function avoidSignalPortY(
   module: CircuitModule,
   port: CircuitPort,
@@ -3287,6 +3392,48 @@ function signalPortPointBlocked(module: CircuitModule, port: CircuitPort, point:
     const bounds = padBounds(componentBounds(component), ROUTE_OBSTACLE_PADDING);
     return point.x >= bounds.minX && point.x <= bounds.maxX && point.y >= bounds.minY && point.y <= bounds.maxY;
   });
+}
+
+/**
+ * Keep-out box for a net label's rendered TEXT only (glyph/stub excluded):
+ * foreign routes must not slide under the text, but a wire passing beside a
+ * rail glyph stays legal so existing fan-out topologies are preserved.
+ */
+function netLabelRouteObstacle(label: SchematicNetLabel): NetRouteObstacle {
+  const halfTextWidth = label.name.length * 4 + 8;
+  const text = netLabelTextAnchor(label);
+  const minY = text.baseline - 13;
+  const maxY = text.baseline + 5;
+  if (text.anchor === 'start') {
+    return { minX: text.x - 2, maxX: text.x + halfTextWidth * 2, minY, maxY, net: label.net };
+  }
+  if (text.anchor === 'end') {
+    return { minX: text.x - halfTextWidth * 2, maxX: text.x + 2, minY, maxY, net: label.net };
+  }
+  return {
+    minX: text.x - halfTextWidth,
+    maxX: text.x + halfTextWidth,
+    minY,
+    maxY,
+    net: label.net,
+  };
+}
+
+/** Baseline/anchor of the label text, mirroring the SVG label renderers. */
+function netLabelTextAnchor(
+  label: SchematicNetLabel,
+): { x: number; baseline: number; anchor: 'start' | 'end' | 'middle' } {
+  const { position } = label;
+  if (label.kind === 'power') return { x: position.x, baseline: position.y - 18, anchor: 'middle' };
+  if (label.kind === 'ground') return { x: position.x, baseline: position.y + 54, anchor: 'middle' };
+  const side = label.side ?? 'right';
+  const stub = 34;
+  const endX = position.x + (side === 'left' ? -stub : side === 'right' ? stub : 0);
+  const endY = position.y + (side === 'top' ? -stub : side === 'bottom' ? stub : 0);
+  if (side === 'left') return { x: endX - 6, baseline: endY + 4, anchor: 'end' };
+  if (side === 'right') return { x: endX + 6, baseline: endY + 4, anchor: 'start' };
+  if (side === 'top') return { x: endX, baseline: endY - 8, anchor: 'middle' };
+  return { x: endX, baseline: endY + 18, anchor: 'middle' };
 }
 
 export function moduleBounds(
@@ -3772,6 +3919,7 @@ function routePointsForModule(
   endEndpoint?: CircuitWireEndpoint,
   net?: string,
   occupiedWires: CircuitWire[] = [],
+  labelObstacles: NetRouteObstacle[] = [],
 ): CircuitPosition[] {
   // qucs-style: leave the owning symbol along the pin outward axis before any
   // Manhattan detour. Start/end components are excluded from obstacles so a
@@ -3789,8 +3937,10 @@ function routePointsForModule(
   if (clear.length > 0) {
     return clear.sort((left, right) => (
       routeCost(left) + routeCrossingPenalty(left, net, occupiedWires) +
+        routeLabelPenalty(left, net, labelObstacles) +
         routeEndpointEgressPenalty(module, left, startEndpoint, endEndpoint) -
       routeCost(right) - routeCrossingPenalty(right, net, occupiedWires) -
+        routeLabelPenalty(right, net, labelObstacles) -
         routeEndpointEgressPenalty(module, right, startEndpoint, endEndpoint)
     ))[0] ?? clear[0]!;
   }
@@ -3814,6 +3964,14 @@ function endpointOutwardStep(
   const pin = pinIndex >= 0 ? component?.pins[pinIndex] : undefined;
   if (!component || !pin) return point;
   const pinPoint = pinWorld(component, pin, pinIndex);
+  // Block pins know their edge: on tall/wide symbols the position delta is
+  // dominated by the long axis and would egress along the edge, not out of it.
+  if (isBlockLike(component) && pin.side) {
+    if (pin.side === 'right') return snapPoint({ x: point.x + distance, y: point.y });
+    if (pin.side === 'left') return snapPoint({ x: point.x - distance, y: point.y });
+    if (pin.side === 'top') return snapPoint({ x: point.x, y: point.y - distance });
+    return snapPoint({ x: point.x, y: point.y + distance });
+  }
   const outward = { x: pinPoint.x - component.position.x, y: pinPoint.y - component.position.y };
   if (Math.abs(outward.x) < 0.5 && Math.abs(outward.y) < 0.5) return point;
   if (Math.abs(outward.x) >= Math.abs(outward.y)) {
@@ -3825,6 +3983,7 @@ function endpointOutwardStep(
 function routeCrossingPenalty(points: CircuitPosition[], net: string | undefined, occupiedWires: CircuitWire[]): number {
   if (!net || occupiedWires.length === 0) return 0;
   let conflicts = 0;
+  let proximity = 0;
   for (const wire of occupiedWires) {
     if (!wire.net || wire.net === net) continue;
     const occupiedPoints = wire.points ?? [];
@@ -3836,11 +3995,44 @@ function routeCrossingPenalty(points: CircuitPosition[], net: string | undefined
         const rightStart = occupiedPoints[rightIndex - 1];
         const rightEnd = occupiedPoints[rightIndex];
         if (!rightStart || !rightEnd) continue;
-        if (orthogonalSegmentsConflict(leftStart, leftEnd, rightStart, rightEnd)) conflicts += 1;
+        if (orthogonalSegmentsConflict(leftStart, leftEnd, rightStart, rightEnd)) {
+          conflicts += 1;
+        } else {
+          // Hugging an occupied track (< 2 grid lanes away) spreads parallel fan-out
+          // runs across distinct channels instead of gluing them into one bundle.
+          proximity += parallelSegmentProximity(leftStart, leftEnd, rightStart, rightEnd);
+        }
       }
     }
   }
-  return conflicts * 1_000_000;
+  return conflicts * 1_000_000 + proximity;
+}
+
+/**
+ * Overlap-length penalty for parallel segments of different nets running on
+ * adjacent (but not coincident) tracks; coincident overlap is already a conflict.
+ */
+function parallelSegmentProximity(
+  leftStart: CircuitPosition,
+  leftEnd: CircuitPosition,
+  rightStart: CircuitPosition,
+  rightEnd: CircuitPosition,
+): number {
+  const leftVertical = leftStart.x === leftEnd.x;
+  const rightVertical = rightStart.x === rightEnd.x;
+  if (leftVertical !== rightVertical) return 0;
+  if (!leftVertical && leftStart.y !== leftEnd.y) return 0;
+  if (!rightVertical && rightStart.y !== rightEnd.y) return 0;
+  const trackDistance = leftVertical
+    ? Math.abs(leftStart.x - rightStart.x)
+    : Math.abs(leftStart.y - rightStart.y);
+  if (trackDistance === 0 || trackDistance >= SCHEMATIC_GRID * 2) return 0;
+  const leftMin = leftVertical ? Math.min(leftStart.y, leftEnd.y) : Math.min(leftStart.x, leftEnd.x);
+  const leftMax = leftVertical ? Math.max(leftStart.y, leftEnd.y) : Math.max(leftStart.x, leftEnd.x);
+  const rightMin = leftVertical ? Math.min(rightStart.y, rightEnd.y) : Math.min(rightStart.x, rightEnd.x);
+  const rightMax = leftVertical ? Math.max(rightStart.y, rightEnd.y) : Math.max(rightStart.x, rightEnd.x);
+  const overlap = Math.min(leftMax, rightMax) - Math.max(leftMin, rightMin);
+  return overlap > 0 ? overlap : 0;
 }
 
 function orthogonalSegmentsConflict(
@@ -3873,6 +4065,33 @@ function orthogonalSegmentsConflict(
     horizontalStart.y >= Math.min(verticalStart.y, verticalEnd.y) &&
     horizontalStart.y <= Math.max(verticalStart.y, verticalEnd.y);
 }
+/**
+ * Soft keep-out for foreign net labels: a route that slides under another
+ * net's label text is strongly discouraged but never forces the obstacle-
+ * ignoring fallback (unlike a hard obstacle would).
+ */
+function routeLabelPenalty(
+  points: CircuitPosition[],
+  net: string | undefined,
+  labelObstacles: NetRouteObstacle[],
+): number {
+  if (labelObstacles.length === 0) return 0;
+  let hits = 0;
+  for (const obstacle of labelObstacles) {
+    if (net && obstacle.net === net) continue;
+    for (let index = 1; index < points.length; index += 1) {
+      const start = points[index - 1];
+      const end = points[index];
+      if (!start || !end) continue;
+      if (segmentIntersectsBounds(start, end, obstacle)) {
+        hits += 1;
+        break;
+      }
+    }
+  }
+  return hits * 250_000;
+}
+
 function obstaclesForEndpoints(
   module: CircuitModule,
   startEndpoint?: CircuitWireEndpoint,
@@ -4722,7 +4941,11 @@ function rotateOffset(offset: CircuitPosition, rotation: number): CircuitPositio
 function materializeNetWires(
   module: CircuitModule,
   portPositions: Map<string, CircuitPosition>,
+  netLabels: SchematicNetLabel[] = [],
 ): CircuitWire[] {
+  // Net-label text stays clear of generated routes: a fan-out wire should
+  // not slide under another net's label text (deterministic soft penalties).
+  const labelObstacles = netLabels.map(netLabelRouteObstacle);
   const stored = (module.wires ?? [])
     .filter((wire) => (wire.points ?? []).length >= 2)
     .map((wire) => ({ ...syncWireEndpointPoints(module, wire, portPositions), source: 'stored' as const }));
@@ -4787,7 +5010,7 @@ function materializeNetWires(
           continue;
         }
       }
-      const treeWires = materializeEndpointTreeWires(module, net, endpoints, existingIds, usedPairs, wires);
+      const treeWires = materializeEndpointTreeWires(module, net, endpoints, existingIds, usedPairs, wires, labelObstacles);
       if (treeWires.length > 0) {
         wires.push(...treeWires);
         continue;
@@ -4822,7 +5045,7 @@ function materializeNetWires(
         id,
         points: fastImplicitRouting
           ? routePoints(startPoint, endPoint)
-          : routePointsForModule(module, startPoint, endPoint, anchor, endpoint, net, wires),
+          : routePointsForModule(module, startPoint, endPoint, anchor, endpoint, net, wires, labelObstacles),
         from: stripEndpoint(startPoint, anchor),
         to: stripEndpoint(endPoint, endpoint),
         net,
@@ -5019,6 +5242,7 @@ function materializeEndpointTreeWires(
   existingIds: Set<string>,
   usedPairs: Set<string>,
   occupiedWires: CircuitWire[],
+  labelObstacles: NetRouteObstacle[] = [],
 ): CircuitWire[] {
   const root = cmosRingFeedbackAnchor(module, net, endpoints) ??
     endpoints.find((endpoint) => endpoint.kind === 'port') ?? chooseNetAnchor(module, net, endpoints);
@@ -5051,6 +5275,7 @@ function materializeEndpointTreeWires(
           target,
           net,
           occupiedWires,
+          labelObstacles,
         );
         const cost = routeCost(points) + routeCrossingPenalty(points, net, occupiedWires);
         if (!best || cost < best.cost) {

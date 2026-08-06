@@ -23,6 +23,7 @@ import { fixtures, moduleFixture, component, ldoPorts } from './lib/schematic-fi
 
 
 assertJunctionNetIsolation();
+assertBlockEdgePortFanout();
 assertManualWireTopology();
 assertGroundPseudoComponent();
 assertPlacedComponentDefaults();
@@ -516,9 +517,21 @@ function assertJunctionNetIsolation() {
     ],
   } as unknown as ReturnType<typeof createSchematicDocument>;
   assert.deepEqual(
-    junctions(sameNetInteriorCrossing),
+    junctions(sameNetInteriorCrossing).map((junction) => ({ net: junction.net, x: junction.point.x, y: junction.point.y })),
+    [{ net: 'a', x: 40, y: 40 }],
+    'same-net interior crossings are one electrical node and must create a junction dot',
+  );
+
+  const crossNetInteriorCrossing = {
+    wires: [
+      { id: 'a1', net: 'a', source: 'net', points: [{ x: 0, y: 40 }, { x: 80, y: 40 }] },
+      { id: 'b1', net: 'b', source: 'net', points: [{ x: 40, y: 0 }, { x: 40, y: 80 }] },
+    ],
+  } as unknown as ReturnType<typeof createSchematicDocument>;
+  assert.deepEqual(
+    junctions(crossNetInteriorCrossing),
     [],
-    'interior wire crossings must stay unconnected unless an endpoint or explicit junction is present',
+    'different-net interior crossings render as plain crossings without a junction dot',
   );
 
   const passThroughBranch = {
@@ -561,6 +574,82 @@ function assertJunctionNetIsolation() {
     [{ net: 'a', x: 40, y: 40 }],
     'branched same-net wires into a component pin should create one junction dot',
   );
+}
+
+function assertBlockEdgePortFanout() {
+  const module = moduleFixture('block_edge_fanout', [{
+    id: 'u1',
+    type: 'BLOCK',
+    name: 'U1',
+    value: 'MCU',
+    position: { x: 300, y: 300 },
+    rotation: 0,
+    pins: [
+      { id: 'pa0', name: 'PA0', net: 'pa0', side: 'right', order: 0 },
+      { id: 'pa1', name: 'PA1', net: 'pa1', side: 'right', order: 1 },
+      { id: 'pa2', name: 'PA2', net: 'pa2', side: 'right', order: 2 },
+      { id: 'pb0', name: 'PB0', net: 'pb0', side: 'left', order: 0 },
+    ],
+    block: { width: 200, height: 200 },
+  }], [
+    { id: 'pa0', name: 'PA0', direction: 'bidirectional', signal_type: 'digital', net: 'pa0' },
+    { id: 'pa1', name: 'PA1', direction: 'bidirectional', signal_type: 'digital', net: 'pa1' },
+    { id: 'pa2', name: 'PA2', direction: 'bidirectional', signal_type: 'digital', net: 'pa2' },
+    { id: 'pb0', name: 'PB0', direction: 'bidirectional', signal_type: 'digital', net: 'pb0' },
+  ]);
+  const document = createSchematicDocument(module, { autoLayout: false });
+  const block = document.module.components.find((entry) => entry.id === 'u1')!;
+  const body = componentBounds(block);
+  for (const portId of ['pa0', 'pa1', 'pa2']) {
+    const position = document.portPositions.get(portId);
+    assert.ok(position, `port ${portId} should be placed`);
+    assert.ok(
+      position!.x > body.maxX,
+      `port ${portId} should sit beside the block's right edge that carries its pin, not behind the body`,
+    );
+  }
+  const pb0 = document.portPositions.get('pb0');
+  assert.ok(pb0 && pb0.x < body.minX, 'left-edge pin ports stay on the left of the block body');
+
+  // The fan-out collapses to short stubs beside the body edge: no wire may
+  // dive back across the block body, and different nets may not share a
+  // coincident vertical track (deterministic channel spreading).
+  const fanout = document.wires.filter((wire) => ['pa0', 'pa1', 'pa2'].includes(wire.net ?? ''));
+  assert.equal(fanout.length, 3, 'each single-pin port net should materialize exactly one wire');
+  for (const wire of fanout) {
+    const points = wire.points ?? [];
+    for (let index = 1; index < points.length; index += 1) {
+      const start = points[index - 1]!;
+      const end = points[index]!;
+      const minX = Math.min(start.x, end.x);
+      const maxX = Math.max(start.x, end.x);
+      const minY = Math.min(start.y, end.y);
+      const maxY = Math.max(start.y, end.y);
+      const entersBody = maxX > body.minX && minX < body.maxX && maxY > body.minY && minY < body.maxY;
+      assert.ok(!entersBody, `wire ${wire.id} (${wire.net}) must not cross the block body`);
+    }
+  }
+  const verticals = fanout.flatMap((wire) => {
+    const points = wire.points ?? [];
+    const segments: Array<{ net: string; x: number; minY: number; maxY: number }> = [];
+    for (let index = 1; index < points.length; index += 1) {
+      const start = points[index - 1]!;
+      const end = points[index]!;
+      if (start.x === end.x && start.y !== end.y) {
+        segments.push({ net: wire.net ?? '', x: start.x, minY: Math.min(start.y, end.y), maxY: Math.max(start.y, end.y) });
+      }
+    }
+    return segments;
+  });
+  for (let left = 0; left < verticals.length; left += 1) {
+    for (let right = left + 1; right < verticals.length; right += 1) {
+      const a = verticals[left]!;
+      const b = verticals[right]!;
+      if (a.net === b.net || a.x !== b.x) continue;
+      const overlap = Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY);
+      assert.ok(overlap <= 0, `nets ${a.net} and ${b.net} must not overlap on vertical track x=${a.x}`);
+    }
+  }
 }
 
 function assertReadableLayout(module: CircuitModule) {

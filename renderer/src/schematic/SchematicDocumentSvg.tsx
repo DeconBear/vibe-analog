@@ -252,7 +252,7 @@ export function SchematicDocumentSvg({
           />
         ) : null}
       </g>
-      <TopologyCrossingLayer document={document} />
+
       <g data-layer="net-labels">
         {document.netLabels.map((label) => (
           // Rail labels (GND / power) are first-class selectable entities with
@@ -757,30 +757,6 @@ function InlineDiagnosticLayer({ diagnostics }: { diagnostics: LiveErcDiagnostic
   );
 }
 
-function TopologyCrossingLayer({ document }: { document: SchematicDocument }) {
-  return (
-    <g data-layer="unconnected-crossings" pointerEvents="none">
-      {unconnectedCrossings(document).map((crossing) => (
-        <g
-          key={`${crossing.point.x},${crossing.point.y}:${crossing.nets.join(':')}`}
-          data-testid="schematic-unconnected-crossing"
-          data-nets={crossing.nets.join(',')}
-        >
-          <circle cx={crossing.point.x} cy={crossing.point.y} r="6.5" fill="#ffffff" />
-          <line
-            x1={crossing.point.x - 7}
-            y1={crossing.point.y}
-            x2={crossing.point.x + 7}
-            y2={crossing.point.y}
-            stroke={WIRE_COLOR}
-            strokeWidth={WIRE_STROKE}
-            strokeLinecap="round"
-          />
-        </g>
-      ))}
-    </g>
-  );
-}
 
 function TopologyEndpointMarkers({ document }: { document: SchematicDocument }) {
   const pins = pinConnectionVisuals(document);
@@ -1590,6 +1566,14 @@ export function junctions(document: SchematicDocument): RenderedJunction[] {
         if (!pointOnSegment(point, left)) continue;
         addSegmentDirectionsAtPoint(junctionMap, left, point);
         addSegmentDirectionsAtPoint(junctionMap, right, point);
+      }
+      // Same-net wires that cross are one electrical node: mark the
+      // connection (T or X) with a junction dot. Different-net crossings
+      // never reach this loop and render as plain crossings.
+      const crossing = orthogonalSegmentIntersection(left, right);
+      if (crossing) {
+        addSegmentDirectionsAtPoint(junctionMap, left, crossing);
+        addSegmentDirectionsAtPoint(junctionMap, right, crossing);
       }
     }
   }

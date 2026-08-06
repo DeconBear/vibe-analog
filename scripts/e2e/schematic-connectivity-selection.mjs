@@ -51,7 +51,8 @@ try {
   page.setDefaultTimeout(30_000);
   await openEditor();
 
-  assert.equal(await page.getByTestId('schematic-unconnected-crossing').count(), 1);
+  // Different-net crossings render as plain crossings: no hop/bridge marker, no junction dot.
+  assert.equal(await page.getByTestId('schematic-unconnected-crossing').count(), 0);
   assert.ok(await page.getByTestId('schematic-junction').count() >= 1);
   assert.ok(await page.getByTestId('schematic-dangling-wire-end').count() >= 1);
   assert.equal(
