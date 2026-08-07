@@ -10,7 +10,11 @@ Covers three guarantees that the compact-cell autorouter cannot provide:
   kicad-cli is installed);
 * components carrying ``eda.symbol``/``eda.footprint`` embed the real bundled
   KiCad symbol (with ``extends`` inheritance resolved) and write the
-  Footprint property, while plain components keep the generated symbols.
+  Footprint property, while plain components keep the generated symbols;
+* referenced footprints that ship in the bundled kicad-lib are packaged as
+  ``footprints/<Lib>.pretty/*.kicad_mod`` with a project-level
+  ``fp-lib-table``, and each packaged footprint's pads must cover the symbol
+  pin numbers used with it (extras allowed; missing pads abort the export).
 
 Run: python scripts/eda-export-labels-regression.py
 """
@@ -247,6 +251,44 @@ def assert_no_text_collisions(export_root: Path, context: str) -> None:
         assert not collisions, f"{context}: property text blocks collide in {schematic.name}: {collisions[:5]}"
 
 
+def assert_footprint_packaging(export_root: Path, context: str) -> dict:
+    """The KiCad package must carry every referenced bundled footprint.
+
+    Checks: fp-lib-table entries resolve to real packaged .pretty directories,
+    every packaged footprint file exists and its pads cover the symbol pin
+    numbers used with it, and every non-empty Footprint property in the
+    generated schematics is either packaged or recorded as skipped.
+    """
+
+    kicad_dir = export_root / "kicad"
+    table_path = kicad_dir / "fp-lib-table"
+    report_path = kicad_dir / "footprint-report.json"
+    assert table_path.is_file(), f"{context}: fp-lib-table missing"
+    assert report_path.is_file(), f"{context}: footprint-report.json missing"
+    entries = re.findall(r'\(lib \(name "([^"]+)"\)\(type "KiCad"\)\(uri "([^"]+)"\)', table_path.read_text(encoding="utf-8"))
+    assert entries, f"{context}: fp-lib-table has no entries"
+    for nickname, uri in entries:
+        assert uri == f"${{KIPRJMOD}}/footprints/{nickname}.pretty", f"{context}: unexpected fp-lib-table uri {uri}"
+        assert (kicad_dir / "footprints" / f"{nickname}.pretty").is_dir(), (
+            f"{context}: fp-lib-table entry {nickname} does not resolve to a packaged directory"
+        )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    packaged: dict[str, dict] = {}
+    for entry in report["packaged"]:
+        packaged[entry["id"]] = entry
+        assert (kicad_dir / entry["path"]).is_file(), f"{context}: packaged footprint file missing: {entry['path']}"
+        missing = set(entry["symbol_pins"]) - set(entry["pads"])
+        assert not missing, f"{context}: footprint {entry['id']} is missing pads {sorted(missing)}"
+    skipped = {entry["id"] for entry in report["skipped"]}
+    assert not skipped & set(packaged), f"{context}: footprint both packaged and skipped"
+    for schematic in sorted(kicad_dir.glob("*.kicad_sch")):
+        for footprint_id in re.findall(r'\(property "Footprint" "([^"]+)"', schematic.read_text(encoding="utf-8")):
+            assert footprint_id in packaged or footprint_id in skipped, (
+                f"{context}: {schematic.name} references unpackaged footprint {footprint_id}"
+            )
+    return report
+
+
 def assert_stacked_passives_text(output: Path) -> None:
     """Vertically stacked library passives must not collide property texts.
 
@@ -323,6 +365,16 @@ def assert_stacked_passives_text(output: Path) -> None:
     assert result["ok"], f"stacked-passives export failed: {result}"
     export_root = Path(result["export_root"])
     assert_no_text_collisions(export_root, "stacked passives")
+    report = assert_footprint_packaging(export_root, "stacked passives")
+    packaged = {entry["id"] for entry in report["packaged"]}
+    assert packaged == {
+        "Capacitor_SMD:C_0603_1608Metric",
+        "Resistor_SMD:R_0603_1608Metric",
+        "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+    }, f"stacked passives must package the referenced bundled footprints: {sorted(packaged)}"
+    # The fixture's eda.footprint SOT-223 is not in the bundled kicad-lib; it
+    # must be skipped (left for the user's own KiCad libraries), not fatal.
+    assert [entry["id"] for entry in report["skipped"]] == ["Package_TO_SOT_SMD:SOT-223"]
     if find_kicad_cli():
         detail = result["manifest"]["targets"]["kicad"]["detail"]
         assert detail.get("connectivity_roundtrip") == "passed"
@@ -389,6 +441,7 @@ def assert_project_scope_export(output: Path, project: dict, modules: dict) -> N
     report = validate_kicad_package(kicad_dir, ir, symbol_map)
     assert report["passed"]
     assert_no_text_collisions(export_root, "project scope")
+    assert_footprint_packaging(export_root, "project scope")
     if find_kicad_cli():
         detail = result["manifest"]["targets"]["kicad"]["detail"]
         assert detail.get("connectivity_roundtrip") == "passed", (
@@ -587,6 +640,13 @@ def assert_label_mode_export(export_root: Path, result: dict) -> None:
     report = validate_kicad_package(kicad_dir, ir, symbol_map)
     assert report["passed"] and report["instances"] == len(page["components"])
 
+    # Footprint packaging: the MCU footprint ships in the package and its
+    # pads cover all 48 symbol pins; fp-lib-table entries resolve in-package.
+    footprint_report = assert_footprint_packaging(export_root, "label mode")
+    mcu_entry = next(entry for entry in footprint_report["packaged"] if entry["id"] == "Package_QFP:LQFP-48_7x7mm_P0.5mm")
+    assert set(mcu_entry["symbol_pins"]) == {str(number) for number in range(1, 49)}
+    assert set(mcu_entry["symbol_pins"]) <= set(mcu_entry["pads"])
+
     detail = result["manifest"]["targets"]["kicad"]["detail"]
     assert detail["structural_status"] == "syntax_validated"
     if find_kicad_cli():
@@ -642,6 +702,14 @@ def main() -> int:
     first_sch = next((first_root / "kicad").glob("*.kicad_sch")).read_bytes()
     second_sch = next((second_root / "kicad").glob("*.kicad_sch")).read_bytes()
     assert first_sch == second_sch, "label-mode export must be deterministic"
+    for relative in (
+        "fp-lib-table",
+        "footprint-report.json",
+        "footprints/Package_QFP.pretty/LQFP-48_7x7mm_P0.5mm.kicad_mod",
+    ):
+        assert (first_root / "kicad" / relative).read_bytes() == (second_root / "kicad" / relative).read_bytes(), (
+            f"footprint packaging must be byte-deterministic: {relative}"
+        )
 
     # The plain in-memory path (no export wrapper) agrees on the IR.
     ir, _ = build_eda_ir(project, modules, scope="module", module_id="mcu_board", view="design", document_hash=DOCUMENT_HASH)

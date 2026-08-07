@@ -28,7 +28,7 @@ from eda_symbols import (
     prepare_component,
     resolve_symbol_map,
 )
-from kicad_lib_embed import symbol_definition_lines, symbol_pin_positions
+from kicad_lib_embed import find_footprint_file, footprint_pad_numbers, symbol_definition_lines, symbol_footprint, symbol_pin_positions
 
 
 EDA_IR_SCHEMA = "actoviq.eda-ir.v1"
@@ -4071,6 +4071,124 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
     return lines
 
 
+def _pad_sort_key(value: str) -> tuple[int, int, str]:
+    return (0, int(value), "") if value.isdigit() else (1, 0, value)
+
+
+def _kicad_footprint_references(all_components: list[dict[str, Any]], symbol_map: dict[str, Any]) -> dict[str, set[str]]:
+    """Map each referenced footprint id to the symbol pin numbers used with it.
+
+    Mirrors every place a Footprint property can enter the generated
+    schematics: the instance property (``eda.footprint``/``footprint``), the
+    generated symbol definition (``binding.footprint``), and the default
+    Footprint property embedded with a real library symbol.
+    """
+
+    references: dict[str, set[str]] = {}
+    for component in all_components:
+        binding = binding_for(symbol_map, "kicad", component["page_id"], component)
+        eda = component.get("eda") or {}
+        candidates = {
+            str(value).strip()
+            for value in (binding.get("footprint"), component.get("footprint"), eda.get("footprint"))
+            if str(value or "").strip()
+        }
+        if binding.get("library_symbol"):
+            default = symbol_footprint(str(binding["library"]), str(binding["cell"]))
+            if default:
+                candidates.add(default)
+        if not candidates:
+            continue
+        pin_numbers = {str(binding["pin_map"][str(pin["id"])]) for pin in component.get("pins", [])}
+        for footprint_id in candidates:
+            references.setdefault(footprint_id, set()).update(pin_numbers)
+    return references
+
+
+def _package_kicad_footprints(target: Path, all_components: list[dict[str, Any]], symbol_map: dict[str, Any]) -> list[Path]:
+    """Copy referenced bundled footprints into the package.
+
+    Writes ``footprints/<Lib>.pretty/<Name>.kicad_mod`` for every referenced
+    footprint that ships in the bundled kicad-lib, a project-level
+    ``fp-lib-table`` mapping each library nickname to its packaged ``.pretty``
+    directory, and a deterministic ``footprint-report.json`` recording the
+    pad coverage of every packaged footprint plus the ids that were skipped
+    because they are not bundled.  A footprint whose pads do not cover the
+    symbol pin numbers used with it aborts the export; extra pads are fine
+    (for example the intentional 2-pin crystal on a 4-pad 3225 footprint).
+    """
+
+    references = _kicad_footprint_references(all_components, symbol_map)
+    if not references:
+        return []
+    packaged: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    written: list[Path] = []
+    libraries: set[str] = set()
+    for footprint_id in sorted(references):
+        library, _, name = footprint_id.partition(":")
+        if not library or not name:
+            raise ValueError(f"invalid KiCad footprint id {footprint_id!r}; expected 'Library:Name'")
+        source = find_footprint_file(footprint_id)
+        if source is None:
+            # Not part of the bundled library: keep the Footprint property
+            # and let the user's own KiCad libraries resolve it.
+            skipped.append({"id": footprint_id, "reason": "footprint is not in the bundled kicad-lib"})
+            continue
+        pretty_dir = target / "footprints" / f"{library}.pretty"
+        pretty_dir.mkdir(parents=True, exist_ok=True)
+        destination = pretty_dir / f"{name}.kicad_mod"
+        shutil.copyfile(source, destination)
+        written.append(destination)
+        libraries.add(library)
+        pads = footprint_pad_numbers(source)
+        symbol_pins = references[footprint_id]
+        missing = sorted(symbol_pins - pads, key=_pad_sort_key)
+        if missing:
+            raise ValueError(
+                f"KiCad footprint {footprint_id} is missing pads {missing} "
+                f"required by the symbol pins {sorted(symbol_pins, key=_pad_sort_key)}"
+            )
+        packaged.append({
+            "id": footprint_id,
+            "path": f"footprints/{library}.pretty/{name}.kicad_mod",
+            "pads": sorted(pads, key=_pad_sort_key),
+            "symbol_pins": sorted(symbol_pins, key=_pad_sort_key),
+        })
+    table_lines = ["(fp_lib_table (version 7)"]
+    for library in sorted(libraries):
+        uri = f"${{KIPRJMOD}}/footprints/{library}.pretty"
+        table_lines.append(
+            f"  (lib (name {_sexpr_string(library)})(type \"KiCad\")(uri {_sexpr_string(uri)})(options \"\")(descr \"Vibe Analog bundled footprints\"))"
+        )
+    table_lines.append(")\n")
+    fp_table = target / "fp-lib-table"
+    _write_text(fp_table, "\n".join(table_lines))
+    report = target / "footprint-report.json"
+    _write_json(report, {"schema": "actoviq.kicad-footprint-report.v1", "packaged": packaged, "skipped": skipped})
+    return [fp_table, report, *written]
+
+
+def _verify_kicad_footprint_properties(target: Path, schematic_files: list[Path]) -> None:
+    """Every non-empty Footprint property in the generated schematics must be
+    either packaged in this export or recorded as skipped (not bundled)."""
+
+    report_path = target / "footprint-report.json"
+    if report_path.is_file():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        accounted = {entry["id"] for entry in report["packaged"]} | {entry["id"] for entry in report["skipped"]}
+    else:
+        accounted = set()
+    unresolved: set[tuple[str, str]] = set()
+    for schematic in schematic_files:
+        for match in re.finditer(r'\(property "Footprint" "((?:[^"\\]|\\.)*)"', schematic.read_text(encoding="utf-8")):
+            footprint_id = match.group(1).replace('\\"', '"').replace("\\\\", "\\")
+            if footprint_id and footprint_id not in accounted:
+                unresolved.add((schematic.name, footprint_id))
+    if unresolved:
+        raise ValueError(f"KiCad schematics reference unpackaged footprints: {sorted(unresolved)}")
+
+
 def _write_kicad(root: Path, project_name: str, ir: dict[str, Any], symbol_map: dict[str, Any]) -> list[Path]:
     target = root / "kicad"
     target.mkdir(parents=True, exist_ok=True)
@@ -4169,8 +4287,10 @@ def _write_kicad(root: Path, project_name: str, ir: dict[str, Any], symbol_map: 
         lines.extend(["  (sheet_instances (path \"/\" (page \"1\")))", ")\n"])
         _write_text(root_schematic, "\n".join(lines))
         schematic_files.insert(0, root_schematic)
+    footprint_files = _package_kicad_footprints(target, all_components, symbol_map)
+    _verify_kicad_footprint_properties(target, schematic_files)
     _write_json(target / "connectivity.json", ir["connectivity"])
-    return [pro, *symbol_files, sym_table, target / "connectivity.json", *schematic_files]
+    return [pro, *symbol_files, sym_table, target / "connectivity.json", *footprint_files, *schematic_files]
 
 
 def _write_altium(root: Path, project_name: str, ir: dict[str, Any], symbol_map: dict[str, Any]) -> list[Path]:

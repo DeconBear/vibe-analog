@@ -148,6 +148,16 @@ def _serialize(node: list[Any], indent: str) -> list[str]:
     return lines
 
 
+def _flattened_symbol(library: str, cell: str) -> list[Any]:
+    path = find_library_file(library)
+    key = (path, cell)
+    flattened = _FLAT_CACHE.get(key)
+    if flattened is None:
+        flattened = _flatten_symbol(_load_symbols(path), cell)
+        _FLAT_CACHE[key] = flattened
+    return flattened
+
+
 def symbol_definition_lines(library: str, cell: str, *, name: str | None = None, indent: str = "  ") -> list[str]:
     """Return the flattened library symbol serialized for export.
 
@@ -156,14 +166,62 @@ def symbol_definition_lines(library: str, cell: str, *, name: str | None = None,
     schematic's embedded ``lib_symbols`` section.
     """
 
-    path = find_library_file(library)
-    key = (path, cell)
-    flattened = _FLAT_CACHE.get(key)
-    if flattened is None:
-        flattened = _flatten_symbol(_load_symbols(path), cell)
-        _FLAT_CACHE[key] = flattened
-    definition = _rename_definition(flattened, cell, name or cell)
+    definition = _rename_definition(_flattened_symbol(library, cell), cell, name or cell)
     return _serialize(definition, indent)
+
+
+def symbol_footprint(library: str, cell: str) -> str:
+    """Return the default Footprint property of a bundled symbol.
+
+    ``extends`` inheritance is resolved first, so a cell that inherits its
+    footprint from a parent symbol reports the parent's value.  Returns ""
+    when the property is unset (the common case for generic Device symbols).
+    """
+
+    flattened = _flattened_symbol(library, cell)
+    for child in _children(flattened, "property"):
+        if len(child) >= 3 and not isinstance(child[1], list) and str(child[1]) == "Footprint":
+            return "" if isinstance(child[2], list) else str(child[2]).strip()
+    return ""
+
+
+def _footprint_search_paths(footprint_id: str) -> list[Path]:
+    library, _, name = footprint_id.partition(":")
+    relative = Path("footprints") / f"{library}.pretty" / f"{name}.kicad_mod"
+    here = Path(__file__).resolve()
+    return [
+        # skills/circuit-design-ngspice/assets/kicad-lib/footprints
+        here.parents[1] / "assets" / "kicad-lib" / relative,
+        # embedded/circuit-design/assets/kicad-lib/footprints (repo mirror)
+        here.parents[3] / "embedded" / "circuit-design" / "assets" / "kicad-lib" / relative,
+    ]
+
+
+def find_footprint_file(footprint_id: str) -> Path | None:
+    """Return the bundled ``.kicad_mod`` for a ``Library:Name`` id, or None.
+
+    None means the footprint is not part of the bundled library; the caller
+    decides whether to skip it (the id may still resolve against the user's
+    own KiCad footprint libraries).
+    """
+
+    for candidate in _footprint_search_paths(footprint_id):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def footprint_pad_numbers(path: Path) -> set[str]:
+    """Return the pad numbers declared by a ``.kicad_mod`` footprint file."""
+
+    parsed = _parse_sexpr(path.read_text(encoding="utf-8"))
+    if _head(parsed) != "footprint":
+        raise ValueError(f"invalid KiCad footprint root: {path}")
+    return {
+        str(pad[1])
+        for pad in _children(parsed, "pad")
+        if len(pad) >= 2 and not isinstance(pad[1], list)
+    }
 
 
 def symbol_pin_positions(library: str, cell: str) -> dict[str, tuple[float, float, float]]:
