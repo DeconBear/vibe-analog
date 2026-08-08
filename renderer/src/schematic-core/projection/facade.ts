@@ -21,6 +21,7 @@ import {
   AUTO_LAYOUT_COMPONENT_LIMIT,
   createSchematicDocumentImplementation,
   deserializeSchematicDocument,
+  resolveSchematicLabelPlacements,
   serializeSchematicDocument,
   type SchematicDocument,
   type SchematicDocumentOptions,
@@ -164,7 +165,7 @@ function reuseProjectedDocument(
       };
     }),
   };
-  return {
+  const document: SchematicDocument = {
     schema: 'actoviq.schematic-document.v1',
     moduleId: nextSource.module_id,
     moduleName: nextSource.name,
@@ -177,7 +178,12 @@ function reuseProjectedDocument(
     wires: clone(previous.wires),
     bounds: clone(previous.bounds),
     viewBox: clone(previous.viewBox),
+    labelPlacements: new Map(),
   };
+  // Recompute rather than reuse: placements depend on label/port text, which is
+  // not part of the geometry identity that allowed this reuse path.
+  document.labelPlacements = resolveSchematicLabelPlacements(document);
+  return document;
 }
 
 /**

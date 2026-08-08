@@ -65,6 +65,17 @@ Pan with middle-drag or space+drag; zoom with wheel / `+` `-` / `Home`.
   bend vertices may be split without throwing.
 - Rename net updates pin/port/wire nets and the module `nets[]` table together.
 
+### Label placement
+
+- Net labels, port names, and component Reference/Value texts share one
+  deterministic collision pass in the projection. When default anchors
+  overlap, labels try a fixed order of grid-step offsets (along their stub,
+  flipped across it, then perpendicular); wire-attached labels never leave
+  their stub. Resolved overrides are stored on the document as
+  `labelPlacements` (`netlabel:<id>`, `port:<id>`,
+  `component:<id>:name|value`); labels absent there render at their default
+  anchor. Same module input always yields the same placement.
+
 ### Hierarchy and search
 
 - Navigate into `module_ref` / hierarchy targets from the editor chrome.

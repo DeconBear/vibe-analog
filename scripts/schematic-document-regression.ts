@@ -3,6 +3,7 @@ import type { CircuitComponent, CircuitModule, CircuitPort } from '../renderer/s
 import {
   addWire,
   blockBodySize,
+  collectSchematicTextItems,
   componentBounds,
   createSchematicDocument,
   endpointWorldPosition,
@@ -16,8 +17,12 @@ import {
   pointEndpoint,
   portRenderSide,
   removeWireAndUpdateConnectivity,
+  schematicTextBounds,
+  SCHEMATIC_GRID,
+  serializeSchematicDocument,
   validateWireTopology,
 } from '../renderer/src/schematic/schematicDocument';
+import type { SchematicTextItem } from '../renderer/src/schematic/schematicDocumentImpl';
 import { junctions } from '../renderer/src/schematic/SchematicDocumentSvg';
 import { fixtures, moduleFixture, component, ldoPorts } from './lib/schematic-fixtures';
 
@@ -30,6 +35,106 @@ assertPlacedComponentDefaults();
 assertRouteEgressAvoidsOwnerBody();
 assertLegacyPortNormalization();
 assertWiredInferredPortPreserved();
+assertLabelPlacementAvoidsCollisions();
+
+function assertLabelPlacementAvoidsCollisions() {
+  // Mirrors the STM32 mcu_core overlap report: a row of same-rail power labels
+  // on adjacent block pins, two signal labels facing each other across the
+  // short gap between adjacent passives, and a component Reference text that
+  // lands on a signal label. Default anchors must collide here (otherwise the
+  // fixture stops guarding anything); the resolved placement must not.
+  const module = moduleFixture('label_collision_avoidance', [
+    {
+      id: 'u1',
+      type: 'BLOCK',
+      name: 'U1',
+      value: 'MCU',
+      position: { x: 240, y: 200 },
+      rotation: 0,
+      pins: [
+        { id: 'v1', name: 'VDD1', net: 'vdd_3v3', side: 'top', order: 0 },
+        { id: 'v2', name: 'VDD2', net: 'vdd_3v3', side: 'top', order: 1 },
+        { id: 'v3', name: 'VDD3', net: 'vdd_3v3', side: 'top', order: 2 },
+        { id: 'v4', name: 'VDDA', net: 'vdda', side: 'top', order: 3 },
+      ],
+      block: { width: 160, height: 120 },
+    } as CircuitComponent,
+    component('r1', 'R', '10k', 560, 300, [['a', '1', 'out'], ['b', '2', 'vdda']]),
+    component('c6', 'C', '100n', 776, 300, [['a', '1', 'vdda'], ['b', '2', '0']]),
+    {
+      ...component('r4', 'R', '10k', 900, 420, [['a', '1', 'out'], ['b', '2', 'vdda']]),
+      rotation: 90,
+    },
+    component('c9', 'C', '10n', 900, 554, [['a', '1', 'out'], ['b', '2', '0']]),
+  ], [
+    { id: 'input', name: 'IN', direction: 'input', signal_type: 'analog', net: 'in' },
+    { id: 'vdd', name: 'VDD_3V3', direction: 'input', signal_type: 'power', net: 'vdd_3v3' },
+    { id: 'output', name: 'OUT', direction: 'output', signal_type: 'analog', net: 'out' },
+    { id: 'gnd', name: 'GND', direction: 'bidirectional', signal_type: 'ground', net: '0' },
+  ]);
+  const document = createSchematicDocument(module, { autoLayout: false });
+
+  const collidingPairs = (usePlacements: boolean) => {
+    const items = collectSchematicTextItems(document).map((item) => {
+      const anchor = usePlacements ? item.placement : item.defaultPlacement;
+      return { item, box: schematicTextBounds(item.text, item.fontSize, anchor.x, anchor.y, anchor.anchor) };
+    });
+    const pairs: Array<[SchematicTextItem, SchematicTextItem]> = [];
+    for (let left = 0; left < items.length; left += 1) {
+      for (let right = left + 1; right < items.length; right += 1) {
+        const a = items[left]!;
+        const b = items[right]!;
+        const overlaps = a.box.minX < b.box.maxX && a.box.maxX > b.box.minX
+          && a.box.minY < b.box.maxY && a.box.maxY > b.box.minY;
+        if (overlaps) pairs.push([a.item, b.item]);
+      }
+    }
+    return pairs;
+  };
+
+  const defaults = collidingPairs(false);
+  assert.ok(
+    defaults.some(([a, b]) => a.kind === 'netlabel' && b.kind === 'netlabel'),
+    'fixture must keep a default netlabel-netlabel collision (e.g. the VDDA pair on adjacent passives)',
+  );
+  assert.ok(
+    defaults.some(([a, b]) => (a.kind === 'netlabel' && b.kind.startsWith('component'))
+      || (b.kind === 'netlabel' && a.kind.startsWith('component'))),
+    'fixture must keep a default netlabel-component-text collision (Reference text over a net label)',
+  );
+
+  const resolved = collidingPairs(true);
+  assert.deepEqual(
+    resolved.map(([a, b]) => `${a.key} <-> ${b.key}`),
+    [],
+    'resolved label placement must be free of text-text collisions',
+  );
+
+  // Avoidance never teleports a label: overrides keep their text-anchor and
+  // stay within a few grids of the default anchor, so wire/stub attachment
+  // remains visually obvious.
+  const itemsByKey = new Map(collectSchematicTextItems(document).map((item) => [item.key, item]));
+  assert.ok(document.labelPlacements.size > 0, 'fixture must exercise non-trivial placement overrides');
+  for (const [key, placement] of document.labelPlacements) {
+    const item = itemsByKey.get(key);
+    assert.ok(item, `placement override ${key} must correspond to a rendered text item`);
+    const base = item.defaultPlacement;
+    assert.equal(placement.anchor, base.anchor, `${key} override must keep its text-anchor`);
+    assert.ok(
+      Math.abs(placement.x - base.x) <= 3 * SCHEMATIC_GRID && Math.abs(placement.y - base.y) <= 3 * SCHEMATIC_GRID,
+      `${key} override must stay within 3 grids of its default anchor (got ${JSON.stringify(placement)} vs ${JSON.stringify(base)})`,
+    );
+  }
+
+  // Deterministic: the same module projects to byte-identical placements.
+  const again = createSchematicDocument(module, { autoLayout: false });
+  assert.deepEqual(
+    serializeSchematicDocument(again).labelPlacements,
+    serializeSchematicDocument(document).labelPlacements,
+    'label placement must be deterministic for the same module input',
+  );
+}
+
 
 function assertWiredInferredPortPreserved() {
   const port: CircuitPort = {

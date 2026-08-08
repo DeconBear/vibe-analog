@@ -5,22 +5,33 @@ import {
   blockPinBodyWorld,
   blockPinSide,
   componentBounds,
+  componentLabelPositions,
+  COMPONENT_NAME_FONT_SIZE,
+  COMPONENT_VALUE_FONT_SIZE,
+  displayComponentValue,
   isPmosComponent,
   isMosBodyPin,
   isGroundPort,
   isSchematicPortVisible,
+  NET_LABEL_FONT_SIZE,
   netLabelBounds,
+  netLabelTextAnchor,
   pinWorld,
+  PORT_LABEL_FONT_SIZE,
   portInteractionBounds,
+  portNamePosition,
   portRenderSide,
   routePoints,
   SCHEMATIC_GRID,
+  SIGNAL_LABEL_STUB,
   type EndpointHit,
   type SchematicDocument,
   type SchematicBounds,
   type SchematicNetLabel,
   type SchematicPortSide,
   type SchematicSelection,
+  type SchematicTextAnchor,
+  type SchematicTextPlacement,
 } from './schematicDocument';
 import {
   wireSelectionScope,
@@ -35,9 +46,6 @@ const MUTED_LABEL_COLOR = '#334155';
 const LABEL_HALO_COLOR = '#ffffff';
 const LABEL_FONT = 'Arial, Helvetica, sans-serif';
 const MONO_FONT = 'Consolas, monospace';
-const NET_LABEL_FONT_SIZE = 16;
-const COMPONENT_NAME_FONT_SIZE = 17;
-const COMPONENT_VALUE_FONT_SIZE = 15;
 const WIRE_STROKE = 3;
 const SYMBOL_STROKE = 2.4;
 const WIRE_SELECTION_COLOR = '#0ea5e9';
@@ -260,6 +268,7 @@ export function SchematicDocumentSvg({
           <NetLabelSymbol
             key={label.id}
             label={label}
+            placements={document.labelPlacements}
             selected={selection?.kind === 'netlabel' && selection.id === label.id}
             hovered={hoverSelection?.kind === 'netlabel' && hoverSelection.id === label.id && !(selection?.kind === 'netlabel' && selection.id === label.id)}
           />
@@ -272,7 +281,7 @@ export function SchematicDocumentSvg({
           const connected = document.connectedPortIds.has(port.id);
           if (!isSchematicPortVisible(document, port)) return null;
           const portSide = portRenderSide(document, port, position);
-          const labelPosition = portNamePosition(position, portSide);
+          const labelPosition = document.labelPlacements.get(`port:${port.id}`) ?? portNamePosition(position, portSide);
           const interactionBounds = portInteractionBounds(position, portSide);
           const selected = selection?.kind === 'port' && selection.id === port.id;
           const hovered = hoverSelection?.kind === 'port' && hoverSelection.id === port.id && !selected;
@@ -332,7 +341,7 @@ export function SchematicDocumentSvg({
                 x={labelPosition.x}
                 y={labelPosition.y}
                 textAnchor={labelPosition.anchor}
-                fontSize="14"
+                fontSize={PORT_LABEL_FONT_SIZE}
                 fontFamily={LABEL_FONT}
                 fontWeight="700"
                 fill={LABEL_COLOR}
@@ -351,6 +360,7 @@ export function SchematicDocumentSvg({
           <ComponentSymbol
             key={component.id}
             component={component}
+            placements={document.labelPlacements}
             selected={selectionHasComponent(selection, component.id)}
             hovered={selectionHasComponent(hoverSelection, component.id) && !selectionHasComponent(selection, component.id)}
           />
@@ -433,13 +443,18 @@ function railStubPoints(endpoint: CircuitPosition, position: CircuitPosition): C
   return [endpoint, { x: endpoint.x, y: position.y }, position];
 }
 
-function NetLabelSymbol({ label, selected = false, hovered = false }: { label: SchematicNetLabel; selected?: boolean; hovered?: boolean }) {
+function NetLabelSymbol({ label, placements, selected = false, hovered = false }: {
+  label: SchematicNetLabel;
+  placements: Map<string, SchematicTextPlacement>;
+  selected?: boolean;
+  hovered?: boolean;
+}) {
   const { position, endpoint } = label;
-  const nameY = label.kind === 'power' ? position.y - 18 : position.y + 54;
+  const text = placements.get(`netlabel:${label.id}`) ?? netLabelTextAnchor(label);
   const hit = netLabelBounds(label);
   const chrome = railLabelChromeBounds(label);
   if (label.kind === 'signal') {
-    return <SignalNetLabelSymbol label={label} />;
+    return <SignalNetLabelSymbol label={label} text={text} />;
   }
   const hasStub = Math.abs(endpoint.x - position.x) > 0.5 || Math.abs(endpoint.y - position.y) > 0.5;
   return (
@@ -494,9 +509,9 @@ function NetLabelSymbol({ label, selected = false, hovered = false }: { label: S
         ? <GroundSymbol position={position} />
         : <PowerFlagSymbol position={position} includeLead={false} />}
       <text
-        x={position.x}
-        y={nameY}
-        textAnchor="middle"
+        x={text.x}
+        y={text.y}
+        textAnchor={text.anchor}
         fontSize={NET_LABEL_FONT_SIZE}
         fontFamily={LABEL_FONT}
         fontWeight="700"
@@ -513,15 +528,14 @@ function NetLabelSymbol({ label, selected = false, hovered = false }: { label: S
   );
 }
 
-function SignalNetLabelSymbol({ label }: { label: SchematicNetLabel }) {
+function SignalNetLabelSymbol({ label, text }: { label: SchematicNetLabel; text: SchematicTextPlacement }) {
   const { position } = label;
   const side = label.side ?? 'right';
-  const stubLength = 34;
+  const stubLength = SIGNAL_LABEL_STUB;
   const end = {
     x: position.x + (side === 'left' ? -stubLength : side === 'right' ? stubLength : 0),
     y: position.y + (side === 'top' ? -stubLength : side === 'bottom' ? stubLength : 0),
   };
-  const text = signalLabelTextPosition(end, side);
   const hit = netLabelBounds(label);
   return (
     <g
@@ -571,16 +585,6 @@ function SignalNetLabelSymbol({ label }: { label: SchematicNetLabel }) {
       </text>
     </g>
   );
-}
-
-function signalLabelTextPosition(
-  end: CircuitPosition,
-  side: NonNullable<SchematicNetLabel['side']>,
-): CircuitPosition & { anchor: TextAnchor } {
-  if (side === 'left') return { x: end.x - 6, y: end.y + 4, anchor: 'end' };
-  if (side === 'right') return { x: end.x + 6, y: end.y + 4, anchor: 'start' };
-  if (side === 'top') return { x: end.x, y: end.y - 8, anchor: 'middle' };
-  return { x: end.x, y: end.y + 18, anchor: 'middle' };
 }
 
 type CSSCursor = 'default' | 'crosshair' | 'grab' | 'grabbing' | 'copy' | 'move';
@@ -839,10 +843,17 @@ function WirePointHandles({ wire }: { wire: CircuitWire }) {
   );
 }
 
-const ComponentSymbol = memo(function ComponentSymbol({ component, selected, hovered }: { component: CircuitComponent; selected: boolean; hovered: boolean }) {
+const ComponentSymbol = memo(function ComponentSymbol({ component, placements, selected, hovered }: {
+  component: CircuitComponent;
+  placements?: Map<string, SchematicTextPlacement>;
+  selected: boolean;
+  hovered: boolean;
+}) {
   const bounds = componentBounds(component);
   const pins = component.pins.map((pin, index) => ({ pin, point: pinWorld(component, pin, index) }));
   const labels = componentLabelPositions(component);
+  const nameLabel = placements?.get(`component:${component.id}:name`) ?? labels.name;
+  const valueLabel = placements?.get(`component:${component.id}:value`) ?? labels.value;
   return (
     <g data-component-id={component.id} data-component-type={component.type} data-hovered={hovered ? 'true' : undefined}>
       {hovered ? <ComponentHoverFrame bounds={bounds} /> : null}
@@ -864,9 +875,9 @@ const ComponentSymbol = memo(function ComponentSymbol({ component, selected, hov
       ))}
       {component.type !== 'GND' ? (
         <text
-          x={labels.name.x}
-          y={labels.name.y}
-          textAnchor={labels.name.anchor}
+          x={nameLabel.x}
+          y={nameLabel.y}
+          textAnchor={nameLabel.anchor}
           fontSize={COMPONENT_NAME_FONT_SIZE}
           fontFamily={LABEL_FONT}
           fontWeight="700"
@@ -882,9 +893,9 @@ const ComponentSymbol = memo(function ComponentSymbol({ component, selected, hov
       ) : null}
       {component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND' ? (
         <text
-          x={labels.value.x}
-          y={labels.value.y}
-          textAnchor={labels.value.anchor}
+          x={valueLabel.x}
+          y={valueLabel.y}
+          textAnchor={valueLabel.anchor}
           fontSize={COMPONENT_VALUE_FONT_SIZE}
           fontFamily={LABEL_FONT}
           fill={LABEL_COLOR}
@@ -1023,91 +1034,6 @@ function ComponentSelectionHandles({ bounds }: { bounds: ReturnType<typeof compo
   );
 }
 
-type TextAnchor = 'start' | 'middle' | 'end';
-
-function portNamePosition(position: CircuitPosition, side: SchematicPortSide): CircuitPosition & { anchor: TextAnchor } {
-  if (side === 'right') {
-    return { x: position.x + 50, y: position.y - 4, anchor: 'start' };
-  }
-  if (side === 'left') {
-    return { x: position.x - 50, y: position.y - 4, anchor: 'end' };
-  }
-  if (side === 'top') {
-    return { x: position.x, y: position.y - 54, anchor: 'middle' };
-  }
-  return { x: position.x + 12, y: position.y + 38, anchor: 'start' };
-}
-
-function componentLabelPositions(component: CircuitComponent): {
-  name: CircuitPosition & { anchor: TextAnchor };
-  value: CircuitPosition & { anchor: TextAnchor };
-} {
-  const { x, y } = component.position;
-  const rotation = ((component.rotation ?? 0) % 360 + 360) % 360;
-  const isVerticalTwoPin = component.pins.length === 2 && (rotation === 90 || rotation === 270);
-  // Gate-drive V/I sources sit left of MOSFET gates. Keep their text on the upper-left so
-  // long PULSE(...) strings do not collide with the local GND stub under the negative pin.
-  if (isVerticalTwoPin) {
-    return {
-      name: { x: x - 46, y: y - 28, anchor: 'end' },
-      value: { x: x - 46, y: y - 6, anchor: 'end' },
-    };
-  }
-  if (component.type === 'M') {
-    // Name above the outline; value to the right of the channel so bottom rail stubs stay clear
-    // and side-by-side MOS stages do not stack value text on neighboring gate drivers.
-    return {
-      name: { x, y: y - 66, anchor: 'middle' },
-      value: { x: x + 52, y: y + 8, anchor: 'start' },
-    };
-  }
-  if (component.type === 'Q') {
-    return {
-      name: { x: x + 52, y: y - 52, anchor: 'start' },
-      value: { x: x + 52, y: y + 58, anchor: 'start' },
-    };
-  }
-  if (component.type === 'E') {
-    return {
-      name: { x: x + 8, y: y - 70, anchor: 'middle' },
-      value: { x: x + 8, y: y + 78, anchor: 'middle' },
-    };
-  }
-  if ((component.type === 'BLOCK' || component.type === 'MODULE')) {
-    const { height } = blockBodySize(component);
-    return {
-      name: { x, y: y - height / 2 - 18, anchor: 'middle' },
-      value: { x, y, anchor: 'middle' },
-    };
-  }
-  if ((component.type === 'V' || component.type === 'I') && (component.value ?? '').length > 14) {
-    return {
-      name: { x: x + 46, y: y - 22, anchor: 'start' },
-      value: { x: x + 46, y: y + 24, anchor: 'start' },
-    };
-  }
-  return {
-    name: { x, y: y - 42, anchor: 'middle' },
-    value: { x, y: y + 44, anchor: 'middle' },
-  };
-}
-
-/** Compact long SPICE sources so canvas labels stay readable without changing stored values. */
-function displayComponentValue(value: string | undefined): string {
-  const text = (value ?? '').trim();
-  if (!text) return '';
-  if (text.length <= 22) return text;
-  const pulse = text.match(/^PULSE\s*\(/i);
-  if (pulse) return 'PULSE(...)';
-  const pwl = text.match(/^PWL\s*\(/i);
-  if (pwl) return 'PWL(...)';
-  const sin = text.match(/^SIN\s*\(/i);
-  if (sin) return 'SIN(...)';
-  const exp = text.match(/^EXP\s*\(/i);
-  if (exp) return 'EXP(...)';
-  return `${text.slice(0, 20)}…`;
-}
-
 function LeadLines({ component }: { component: CircuitComponent }) {
   if ((component.type === 'BLOCK' || component.type === 'MODULE')) {
     return (
@@ -1214,7 +1140,7 @@ function SymbolBody({ component }: { component: CircuitComponent }) {
           const horizontalEdge = Math.abs(dx) >= Math.abs(dy);
           const labelX = horizontalEdge ? body.x + (dx < 0 ? 8 : -8) : body.x;
           const labelY = horizontalEdge ? body.y + 5 : body.y + (dy < 0 ? 16 : -8);
-          const anchor: TextAnchor = horizontalEdge ? (dx < 0 ? 'start' : 'end') : 'middle';
+          const anchor: SchematicTextAnchor = horizontalEdge ? (dx < 0 ? 'start' : 'end') : 'middle';
           return (
             <text
               key={`block-pin-label-${pin.id}`}

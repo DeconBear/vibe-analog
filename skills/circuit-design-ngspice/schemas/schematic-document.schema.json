@@ -49,7 +49,21 @@
       "items": { "$ref": "#/$defs/wire" }
     },
     "bounds": { "$ref": "#/$defs/bounds" },
-    "viewBox": { "$ref": "#/$defs/bounds" }
+    "viewBox": { "$ref": "#/$defs/bounds" },
+    "labelPlacements": {
+      "type": "object",
+      "description": "Optional Map<labelKey, TextPlacement> serialized as an object. Deterministically resolved text anchors for labels whose default position collided with another label; keys are `netlabel:<id>`, `port:<id>`, or `component:<id>:name|value`. Labels absent here render at their default anchor.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["x", "y", "anchor"],
+        "properties": {
+          "x": { "type": "number" },
+          "y": { "type": "number" },
+          "anchor": { "enum": ["start", "middle", "end"] }
+        },
+        "additionalProperties": false
+      }
+    }
   },
   "additionalProperties": false,
   "$defs": {

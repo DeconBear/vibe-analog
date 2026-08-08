@@ -74,6 +74,57 @@ export interface SchematicNetLabel {
   side?: 'left' | 'right' | 'top' | 'bottom';
 }
 
+export type SchematicTextAnchor = 'start' | 'middle' | 'end';
+
+/** Resolved text anchor (baseline position + SVG text-anchor) for one label. */
+export interface SchematicTextPlacement extends CircuitPosition {
+  anchor: SchematicTextAnchor;
+}
+
+/**
+ * Font sizes used by the SVG renderer. The label-placement resolver and the
+ * collision assertions approximate text extents with these exact sizes, so
+ * the approximation never drifts from what is actually painted.
+ */
+export const NET_LABEL_FONT_SIZE = 16;
+export const COMPONENT_NAME_FONT_SIZE = 17;
+export const COMPONENT_VALUE_FONT_SIZE = 15;
+export const PORT_LABEL_FONT_SIZE = 14;
+
+/** Average em width of a bold Arial glyph, used for text extent approximation. */
+const LABEL_CHAR_WIDTH_EM = 0.68;
+/**
+ * Vertical extents of a glyph run as a fraction of the font size (ascent /
+ * descent of bold Arial, plus the white halo stroke), and the extra clearance
+ * (px) added around each approximated text box.
+ */
+const LABEL_ASCENT_EM = 0.8;
+const LABEL_DESCENT_EM = 0.3;
+const LABEL_TEXT_MARGIN = 1;
+
+/**
+ * Approximate rendered bounds of a text run painted at (`x`, `y` baseline)
+ * with the given SVG text-anchor. Shared by the deterministic label-placement
+ * resolver and the regression assertions so both judge collisions with the
+ * same metric.
+ */
+export function schematicTextBounds(
+  text: string,
+  fontSize: number,
+  x: number,
+  y: number,
+  anchor: SchematicTextAnchor,
+): SchematicBounds {
+  const width = text.length * fontSize * LABEL_CHAR_WIDTH_EM;
+  const minX = anchor === 'start' ? x : anchor === 'end' ? x - width : x - width / 2;
+  return {
+    minX: minX - LABEL_TEXT_MARGIN,
+    maxX: minX + width + LABEL_TEXT_MARGIN,
+    minY: y - fontSize * LABEL_ASCENT_EM - LABEL_TEXT_MARGIN,
+    maxY: y + fontSize * LABEL_DESCENT_EM + LABEL_TEXT_MARGIN,
+  };
+}
+
 export interface SchematicDocument {
   schema: 'actoviq.schematic-document.v1';
   moduleId: string;
@@ -85,6 +136,13 @@ export interface SchematicDocument {
   wires: CircuitWire[];
   bounds: SchematicBounds;
   viewBox: SchematicBounds;
+  /**
+   * Deterministically resolved text anchors for labels whose default position
+   * collided with another label. Keyed by `netlabel:<id>`, `port:<id>`, and
+   * `component:<id>:name|value`; entries absent here render at their default
+   * anchor. See resolveSchematicLabelPlacements.
+   */
+  labelPlacements: Map<string, SchematicTextPlacement>;
 }
 
 export interface SchematicDocumentOptions {
@@ -111,12 +169,17 @@ export interface SerializableSchematicDocument {
   wires: CircuitWire[];
   bounds: SchematicBounds;
   viewBox: SchematicBounds;
+  labelPlacements: Record<string, SchematicTextPlacement>;
 }
 
 export function serializeSchematicDocument(document: SchematicDocument): SerializableSchematicDocument {
   const portPositions: Record<string, CircuitPosition> = {};
   for (const [id, position] of document.portPositions) {
     portPositions[id] = position;
+  }
+  const labelPlacements: Record<string, SchematicTextPlacement> = {};
+  for (const [key, placement] of document.labelPlacements) {
+    labelPlacements[key] = placement;
   }
   return {
     schema: 'actoviq.schematic-document.v1',
@@ -129,6 +192,7 @@ export function serializeSchematicDocument(document: SchematicDocument): Seriali
     wires: document.wires,
     bounds: document.bounds,
     viewBox: document.viewBox,
+    labelPlacements,
   };
 }
 
@@ -139,6 +203,7 @@ export function deserializeSchematicDocument(
     ...document,
     portPositions: new Map(Object.entries(document.portPositions)),
     connectedPortIds: new Set(document.connectedPortIds),
+    labelPlacements: new Map(Object.entries(document.labelPlacements ?? {})),
   };
 }
 
@@ -213,7 +278,7 @@ export function createSchematicDocumentImplementation(
   );
   const bounds = moduleBounds(next, filterPortPositions(portPositions, visiblePortIds), wires, netLabels);
   const viewBox = padBounds(bounds, viewBoxPadding(bounds));
-  return {
+  const document: SchematicDocument = {
     schema: 'actoviq.schematic-document.v1',
     moduleId: next.module_id,
     moduleName: next.name,
@@ -224,7 +289,10 @@ export function createSchematicDocumentImplementation(
     wires,
     bounds,
     viewBox,
+    labelPlacements: new Map(),
   };
+  document.labelPlacements = resolveSchematicLabelPlacements(document);
+  return document;
 }
 
 /**
@@ -3402,8 +3470,8 @@ function signalPortPointBlocked(module: CircuitModule, port: CircuitPort, point:
 function netLabelRouteObstacle(label: SchematicNetLabel): NetRouteObstacle {
   const halfTextWidth = label.name.length * 4 + 8;
   const text = netLabelTextAnchor(label);
-  const minY = text.baseline - 13;
-  const maxY = text.baseline + 5;
+  const minY = text.y - 13;
+  const maxY = text.y + 5;
   if (text.anchor === 'start') {
     return { minX: text.x - 2, maxX: text.x + halfTextWidth * 2, minY, maxY, net: label.net };
   }
@@ -3419,21 +3487,294 @@ function netLabelRouteObstacle(label: SchematicNetLabel): NetRouteObstacle {
   };
 }
 
-/** Baseline/anchor of the label text, mirroring the SVG label renderers. */
-function netLabelTextAnchor(
-  label: SchematicNetLabel,
-): { x: number; baseline: number; anchor: 'start' | 'end' | 'middle' } {
+/** Length of the stub drawn from the attachment point of a signal net label. */
+export const SIGNAL_LABEL_STUB = 34;
+
+/** Default baseline/anchor of a net label's text, mirroring the SVG label renderers. */
+export function netLabelTextAnchor(label: SchematicNetLabel): SchematicTextPlacement {
   const { position } = label;
-  if (label.kind === 'power') return { x: position.x, baseline: position.y - 18, anchor: 'middle' };
-  if (label.kind === 'ground') return { x: position.x, baseline: position.y + 54, anchor: 'middle' };
+  if (label.kind === 'power') return { x: position.x, y: position.y - 18, anchor: 'middle' };
+  if (label.kind === 'ground') return { x: position.x, y: position.y + 54, anchor: 'middle' };
   const side = label.side ?? 'right';
-  const stub = 34;
+  const stub = SIGNAL_LABEL_STUB;
   const endX = position.x + (side === 'left' ? -stub : side === 'right' ? stub : 0);
   const endY = position.y + (side === 'top' ? -stub : side === 'bottom' ? stub : 0);
-  if (side === 'left') return { x: endX - 6, baseline: endY + 4, anchor: 'end' };
-  if (side === 'right') return { x: endX + 6, baseline: endY + 4, anchor: 'start' };
-  if (side === 'top') return { x: endX, baseline: endY - 8, anchor: 'middle' };
-  return { x: endX, baseline: endY + 18, anchor: 'middle' };
+  if (side === 'left') return { x: endX - 6, y: endY + 4, anchor: 'end' };
+  if (side === 'right') return { x: endX + 6, y: endY + 4, anchor: 'start' };
+  if (side === 'top') return { x: endX, y: endY - 8, anchor: 'middle' };
+  return { x: endX, y: endY + 18, anchor: 'middle' };
+}
+
+/** Default anchor of a port's name text, mirroring the SVG port renderer. */
+export function portNamePosition(position: CircuitPosition, side: SchematicPortSide): SchematicTextPlacement {
+  if (side === 'right') {
+    return { x: position.x + 50, y: position.y - 4, anchor: 'start' };
+  }
+  if (side === 'left') {
+    return { x: position.x - 50, y: position.y - 4, anchor: 'end' };
+  }
+  if (side === 'top') {
+    return { x: position.x, y: position.y - 54, anchor: 'middle' };
+  }
+  return { x: position.x + 12, y: position.y + 38, anchor: 'start' };
+}
+
+/** Default anchors of a component's Reference (name) and Value texts. */
+export function componentLabelPositions(component: CircuitComponent): {
+  name: SchematicTextPlacement;
+  value: SchematicTextPlacement;
+} {
+  const { x, y } = component.position;
+  const rotation = ((component.rotation ?? 0) % 360 + 360) % 360;
+  const isVerticalTwoPin = component.pins.length === 2 && (rotation === 90 || rotation === 270);
+  // Gate-drive V/I sources sit left of MOSFET gates. Keep their text on the upper-left so
+  // long PULSE(...) strings do not collide with the local GND stub under the negative pin.
+  if (isVerticalTwoPin) {
+    return {
+      name: { x: x - 46, y: y - 28, anchor: 'end' },
+      value: { x: x - 46, y: y - 6, anchor: 'end' },
+    };
+  }
+  if (component.type === 'M') {
+    // Name above the outline; value to the right of the channel so bottom rail stubs stay clear
+    // and side-by-side MOS stages do not stack value text on neighboring gate drivers.
+    return {
+      name: { x, y: y - 66, anchor: 'middle' },
+      value: { x: x + 52, y: y + 8, anchor: 'start' },
+    };
+  }
+  if (component.type === 'Q') {
+    return {
+      name: { x: x + 52, y: y - 52, anchor: 'start' },
+      value: { x: x + 52, y: y + 58, anchor: 'start' },
+    };
+  }
+  if (component.type === 'E') {
+    return {
+      name: { x: x + 8, y: y - 70, anchor: 'middle' },
+      value: { x: x + 8, y: y + 78, anchor: 'middle' },
+    };
+  }
+  if ((component.type === 'BLOCK' || component.type === 'MODULE')) {
+    const { height } = blockBodySize(component);
+    return {
+      name: { x, y: y - height / 2 - 18, anchor: 'middle' },
+      value: { x, y, anchor: 'middle' },
+    };
+  }
+  if ((component.type === 'V' || component.type === 'I') && (component.value ?? '').length > 14) {
+    return {
+      name: { x: x + 46, y: y - 22, anchor: 'start' },
+      value: { x: x + 46, y: y + 24, anchor: 'start' },
+    };
+  }
+  return {
+    name: { x, y: y - 42, anchor: 'middle' },
+    value: { x, y: y + 44, anchor: 'middle' },
+  };
+}
+
+/** Compact long SPICE sources so canvas labels stay readable without changing stored values. */
+export function displayComponentValue(value: string | undefined): string {
+  const text = (value ?? '').trim();
+  if (!text) return '';
+  if (text.length <= 22) return text;
+  const pulse = text.match(/^PULSE\s*\(/i);
+  if (pulse) return 'PULSE(...)';
+  const pwl = text.match(/^PWL\s*\(/i);
+  if (pwl) return 'PWL(...)';
+  const sin = text.match(/^SIN\s*\(/i);
+  if (sin) return 'SIN(...)';
+  const exp = text.match(/^EXP\s*\(/i);
+  if (exp) return 'EXP(...)';
+  return `${text.slice(0, 20)}…`;
+}
+
+/**
+ * One rendered text run that participates in label collision resolution.
+ * `defaultPlacement` is the anchor the renderer would use without avoidance;
+ * `placement` applies the resolved override from `document.labelPlacements`.
+ */
+export interface SchematicTextItem {
+  key: string;
+  kind: 'netlabel' | 'port' | 'component-name' | 'component-value';
+  text: string;
+  fontSize: number;
+  defaultPlacement: SchematicTextPlacement;
+  placement: SchematicTextPlacement;
+  /** Owning net label / port side, used to keep avoidance candidates attached. */
+  label?: SchematicNetLabel;
+  portSide?: SchematicPortSide;
+}
+
+/**
+ * Every visible text run of the projection, in the stable order used by the
+ * placement resolver: wire-attached net labels first (least freedom), then
+ * port labels, then component Reference and Value texts (most freedom).
+ */
+export function collectSchematicTextItems(document: SchematicDocument): SchematicTextItem[] {
+  const items: SchematicTextItem[] = [];
+  const apply = (
+    item: Omit<SchematicTextItem, 'placement'>,
+  ) => {
+    items.push({ ...item, placement: document.labelPlacements.get(item.key) ?? item.defaultPlacement });
+  };
+  for (const label of document.netLabels) {
+    apply({
+      key: `netlabel:${label.id}`,
+      kind: 'netlabel',
+      text: label.name,
+      fontSize: NET_LABEL_FONT_SIZE,
+      defaultPlacement: netLabelTextAnchor(label),
+      label,
+    });
+  }
+  for (const port of document.module.ports) {
+    const position = document.portPositions.get(port.id);
+    if (!position || !isSchematicPortVisible(document, port)) continue;
+    const side = portRenderSide(document, port, position);
+    apply({
+      key: `port:${port.id}`,
+      kind: 'port',
+      text: port.name,
+      fontSize: PORT_LABEL_FONT_SIZE,
+      defaultPlacement: portNamePosition(position, side),
+      portSide: side,
+    });
+  }
+  for (const component of document.module.components) {
+    const labels = componentLabelPositions(component);
+    if (component.type !== 'GND') {
+      apply({
+        key: `component:${component.id}:name`,
+        kind: 'component-name',
+        text: component.name,
+        fontSize: COMPONENT_NAME_FONT_SIZE,
+        defaultPlacement: labels.name,
+      });
+    }
+    if (component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND') {
+      const value = displayComponentValue(component.value);
+      if (value) {
+        apply({
+          key: `component:${component.id}:value`,
+          kind: 'component-value',
+          text: value,
+          fontSize: COMPONENT_VALUE_FONT_SIZE,
+          defaultPlacement: labels.value,
+        });
+      }
+    }
+  }
+  return items;
+}
+
+function samePlacement(left: SchematicTextPlacement, right: SchematicTextPlacement): boolean {
+  return left.x === right.x && left.y === right.y && left.anchor === right.anchor;
+}
+
+/**
+ * Ordered avoidance candidates for one text item. Wire-attached labels only
+ * slide along their own stub axis, flip to the other side of it, or step
+ * perpendicular by whole grids, so the text never detaches from its wire;
+ * component texts step on the grid freely. The first candidate is always the
+ * default anchor.
+ */
+function labelPlacementCandidates(item: SchematicTextItem): SchematicTextPlacement[] {
+  const base = item.defaultPlacement;
+  const grid = SCHEMATIC_GRID;
+  const at = (dx: number, dy: number): SchematicTextPlacement => ({ x: base.x + dx, y: base.y + dy, anchor: base.anchor });
+  if (item.kind === 'netlabel' && item.label) {
+    const label = item.label;
+    if (label.kind === 'power') {
+      return [at(0, 0), at(0, -grid), at(0, -2 * grid), at(0, -3 * grid), at(-grid, 0), at(grid, 0)];
+    }
+    if (label.kind === 'ground') {
+      return [at(0, 0), at(0, grid), at(0, 2 * grid), at(0, 3 * grid), at(-grid, 0), at(grid, 0)];
+    }
+    const side = label.side ?? 'right';
+    if (side === 'left' || side === 'right') {
+      const dir = side === 'left' ? -1 : 1;
+      return [
+        at(0, 0),
+        at(0, -grid), at(0, grid),
+        at(0, -2 * grid), at(0, 2 * grid),
+        at(dir * grid, 0), at(dir * 2 * grid, 0),
+        at(dir * grid, -grid), at(dir * grid, grid),
+      ];
+    }
+    const dir = side === 'top' ? -1 : 1;
+    return [
+      at(0, 0),
+      at(-grid, 0), at(grid, 0),
+      at(-2 * grid, 0), at(2 * grid, 0),
+      at(0, dir * grid), at(0, dir * 2 * grid),
+    ];
+  }
+  if (item.kind === 'port' && item.portSide) {
+    const side = item.portSide;
+    if (side === 'left' || side === 'right') {
+      const outward = side === 'left' ? -1 : 1;
+      return [
+        at(0, 0),
+        at(0, -grid), at(0, grid),
+        at(0, -2 * grid), at(0, 2 * grid),
+        at(outward * grid, 0), at(outward * 2 * grid, 0),
+      ];
+    }
+    if (side === 'top') {
+      return [at(0, 0), at(-grid, 0), at(grid, 0), at(0, -grid), at(0, -2 * grid)];
+    }
+    return [at(0, 0), at(0, grid), at(0, 2 * grid), at(-grid, 0), at(grid, 0)];
+  }
+  return [
+    at(0, 0),
+    at(0, -grid), at(0, grid),
+    at(-grid, 0), at(grid, 0),
+    at(0, -2 * grid), at(0, 2 * grid),
+    at(-2 * grid, 0), at(2 * grid, 0),
+    at(0, -3 * grid), at(-3 * grid, 0), at(3 * grid, 0), at(0, 3 * grid),
+  ];
+}
+
+function boundsOverlap(left: SchematicBounds, right: SchematicBounds): boolean {
+  return left.minX < right.maxX && left.maxX > right.minX && left.minY < right.maxY && left.maxY > right.minY;
+}
+
+/**
+ * Deterministic label placement: walk all text runs in a stable order, try
+ * each candidate offset in a fixed order, and take the first one whose
+ * approximated text box collides with nothing already placed (falling back to
+ * the least-colliding candidate when every option overlaps). Same module in,
+ * same layout out. Only non-default anchors are recorded.
+ */
+export function resolveSchematicLabelPlacements(
+  document: SchematicDocument,
+): Map<string, SchematicTextPlacement> {
+  const placements = new Map<string, SchematicTextPlacement>();
+  const placed: SchematicBounds[] = [];
+  const collisionCount = (item: SchematicTextItem, candidate: SchematicTextPlacement) => {
+    const box = schematicTextBounds(item.text, item.fontSize, candidate.x, candidate.y, candidate.anchor);
+    return placed.filter((other) => boundsOverlap(box, other)).length;
+  };
+  for (const item of collectSchematicTextItems(document)) {
+    const candidates = labelPlacementCandidates(item);
+    let best = candidates[0]!;
+    let bestCollisions = collisionCount(item, best);
+    for (let index = 1; index < candidates.length && bestCollisions > 0; index += 1) {
+      const candidate = candidates[index]!;
+      const collisions = collisionCount(item, candidate);
+      if (collisions < bestCollisions) {
+        best = candidate;
+        bestCollisions = collisions;
+      }
+    }
+    if (!samePlacement(best, item.defaultPlacement)) {
+      placements.set(item.key, best);
+    }
+    placed.push(schematicTextBounds(item.text, item.fontSize, best.x, best.y, best.anchor));
+  }
+  return placements;
 }
 
 export function moduleBounds(
