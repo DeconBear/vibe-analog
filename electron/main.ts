@@ -10,7 +10,7 @@ import { registerWorkspaceHandlers } from './ipc/workspaces.js';
 import { generateProjectTechnicalReport, registerProjectHandlers } from './ipc/projects.js';
 import { inspectCircuitSkillStatus, registerSkillHandlers } from './ipc/skills.js';
 import { closeDesktopAgentService } from './agent/desktopAgentService.js';
-import { stopActiveProjectTools } from './agent/circuitProjectCli.js';
+import { prewarmKicadSymbolWorker, stopActiveProjectTools } from './agent/circuitProjectCli.js';
 
 let mainWindow: BrowserWindow | null = null;
 let quitCleanupStarted = false;
@@ -113,6 +113,9 @@ app.whenReady().then(() => {
     app.setAppUserModelId('com.vibeanalog.app');
   }
   registerIpcHandlers();
+  void prewarmKicadSymbolWorker().catch((error) => {
+    console.warn('KiCad symbol worker prewarm failed:', error);
+  });
   void inspectCircuitSkillStatus().catch((error) => {
     console.warn('Circuit skill version check failed:', error);
   });

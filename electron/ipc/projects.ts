@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { layoutVisionModelFingerprint, loadSettings, loadSettingsWithSecrets, resolveNgspiceExecutable } from './settings.js';
 import { getActiveWorkspace } from '../workspaceState.js';
 import { generateDesktopTechnicalReport } from '../agent/desktopAgentService.js';
-import { runProjectTool } from '../agent/circuitProjectCli.js';
+import { resolveKicadSymbolIr, runProjectTool } from '../agent/circuitProjectCli.js';
 import { resolveExecutionProfile } from '../eda/executionProfileRegistry.js';
 
 interface LicensedProviderRuntime {
@@ -2163,10 +2163,7 @@ export function registerProjectHandlers(ipcMain: IpcMain): void {
     if (uniqueIds.length === 0) {
       return { schema: 'actoviq.symbol-ir-bundle.v1', definitions: {}, diagnostics: [] };
     }
-    return runProjectTool([
-      'kicad-symbol-ir',
-      ...uniqueIds.flatMap((symbolId) => ['--symbol', symbolId]),
-    ]);
+    return resolveKicadSymbolIr(uniqueIds);
   });
 
   ipcMain.handle('project:apply-command', async (_event, projectId: string, command: unknown) => {

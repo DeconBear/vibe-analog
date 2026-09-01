@@ -69,6 +69,7 @@
     "test:eda-export": "python scripts/eda-export-regression.py",
     "test:eda-export-labels": "python scripts/eda-export-labels-regression.py",
     "test:kicad-library": "python scripts/kicad-library-regression.py",
+    "test:kicad-worker": "tsx scripts/kicad-symbol-worker-regression.ts",
     "test:place-library-component": "python scripts/place-library-component-regression.py",
     "test:simulation-regression": "python scripts/simulation-regression.py",
     "test:tool-providers": "tsx scripts/tool-providers-regression.ts",
