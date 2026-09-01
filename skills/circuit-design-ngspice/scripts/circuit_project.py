@@ -2733,7 +2733,21 @@ def place_library_component(
     symbol_entry = get_symbol(index, symbol_id)
     if symbol_entry is None:
         raise ValueError(f"unknown library symbol: {symbol_id}")
-    symbol_pins = symbol_entry.get("pins") or []
+    unit_count = int(symbol_entry.get("unit_count", 1) or 1)
+    unit_value = operation.get("unit")
+    if unit_count > 1 and unit_value is None:
+        raise ValueError(f"place_library_component requires unit for multi-unit symbol {symbol_id}")
+    unit = int(unit_value or 1)
+    variant = int(operation.get("symbol_variant") or 1)
+    if unit < 1 or variant < 1:
+        raise ValueError("place_library_component unit and symbol_variant must be positive integers")
+    unit_entries = {
+        int(entry.get("unit", 1)): entry.get("pins") or []
+        for entry in symbol_entry.get("units", [])
+    }
+    if unit not in unit_entries and unit_count > 1:
+        raise ValueError(f"symbol {symbol_id} has no unit {unit}")
+    symbol_pins = unit_entries.get(unit) or symbol_entry.get("pins") or []
     if not symbol_pins:
         raise ValueError(f"library symbol has no pins: {symbol_id}")
     expected_numbers = [str(pin.get("number", "")) for pin in symbol_pins]
@@ -2800,7 +2814,6 @@ def place_library_component(
         position = {"x": float(position["x"]), "y": float(position["y"])}
     else:
         position = None
-    eda_fields = {"symbol": symbol_id, "footprint": footprint, "refdes": name, "library": "kicad"}
     slug_base = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_")
     components = module.setdefault("components", [])
     existing = next(
@@ -2812,6 +2825,77 @@ def place_library_component(
         ),
         None,
     )
+    requested_package_id = str(operation.get("package_id") or "").strip()
+    package_members = [
+        component for component in components
+        if requested_package_id
+        and str((component.get("eda") or {}).get("package_id") or "") == requested_package_id
+    ]
+    if requested_package_id and not package_members and existing is None and unit != 1:
+        raise ValueError(f"unknown library package_id in module {module_id}: {requested_package_id}")
+    if package_members:
+        package_eda = package_members[0].get("eda") or {}
+        if str(package_eda.get("symbol") or "") != symbol_id:
+            raise ValueError(f"package_id {requested_package_id} belongs to another symbol")
+        duplicate = next(
+            (
+                component for component in package_members
+                if int((component.get("eda") or {}).get("unit") or 1) == unit
+                and component is not existing
+            ),
+            None,
+        )
+        if duplicate is not None:
+            raise ValueError(f"package_id {requested_package_id} already contains unit {unit}")
+        package_footprint = str(package_eda.get("footprint") or "")
+        if package_footprint and package_footprint != footprint:
+            raise ValueError(f"package_id {requested_package_id} has conflicting footprint")
+        package_value = str(package_members[0].get("value") or "").strip()
+        requested_value = str(operation.get("value") or "").strip()
+        if package_value and requested_value and package_value != requested_value:
+            raise ValueError(f"package_id {requested_package_id} has conflicting value")
+        value = package_value or requested_value
+        for field in ("lcsc_id", "mpn", "manufacturer"):
+            package_field = str(package_eda.get(field) or "").strip()
+            requested_field = str(operation.get(field) or "").strip()
+            if package_field and requested_field and package_field != requested_field:
+                raise ValueError(f"package_id {requested_package_id} has conflicting {field}")
+        refdes = str(package_eda.get("refdes") or "").strip()
+        requested_refdes = str(operation.get("refdes") or "").strip()
+        if requested_refdes and refdes and requested_refdes != refdes:
+            raise ValueError(f"package_id {requested_package_id} has conflicting refdes")
+        refdes = refdes or requested_refdes or name
+        package_id = requested_package_id
+    else:
+        value = str(operation.get("value") or "").strip()
+        refdes = str(operation.get("refdes") or name).strip()
+        package_id = requested_package_id
+        if not package_id:
+            package_base = f"pkg_{slug_base or 'component'}"
+            package_id = package_base
+            suffix = 2
+            used_packages = {
+                str((component.get("eda") or {}).get("package_id") or "")
+                for component in components
+            }
+            while package_id in used_packages:
+                package_id = f"{package_base}_{suffix}"
+                suffix += 1
+    eda_fields = {
+        "symbol": symbol_id,
+        "footprint": footprint,
+        "refdes": refdes,
+        "library": "kicad",
+        "unit": unit,
+        "symbol_variant": variant,
+        "package_id": package_id,
+    }
+    for field in ("lcsc_id", "mpn", "manufacturer"):
+        field_value = str(operation.get(field) or "").strip()
+        if not field_value and package_members:
+            field_value = str((package_members[0].get("eda") or {}).get(field) or "").strip()
+        if field_value:
+            eda_fields[field] = field_value
     if existing is None:
         used_ids = {str(component.get("id", "")) for component in components}
         if position is None:
@@ -8062,14 +8146,15 @@ def pcb_export_readiness(project: dict[str, Any], modules: dict[str, dict[str, A
     missing_symbol: list[dict[str, str]] = []
     missing_footprint: list[dict[str, str]] = []
     unknown_library_part: list[dict[str, str]] = []
+    library_error: str | None = None
     try:
         index = kicad_library_index()
-    except Exception:
-        # Library unavailable: skip symbol/footprint resolution rather than
-        # flag every component as unknown.
+    except Exception as exc:
+        library_error = str(exc) or exc.__class__.__name__
         index = None
     physical_types = {"R", "C", "L", "D", "Q", "M", "U", "BLOCK", "X"}
     for module_id, module in modules.items():
+        seen_packages: set[str] = set()
         for component in module.get("components", []) or []:
             if not isinstance(component, dict):
                 continue
@@ -8077,6 +8162,11 @@ def pcb_export_readiness(project: dict[str, Any], modules: dict[str, dict[str, A
             if component_type in {"V", "I"} and component.get("mount_policy") != "design_include":
                 continue
             eda = component.get("eda") if isinstance(component.get("eda"), dict) else {}
+            package_id = str(eda.get("package_id") or "").strip()
+            if package_id:
+                if package_id in seen_packages:
+                    continue
+                seen_packages.add(package_id)
             entry = {"module_id": module_id, "component_id": str(component.get("id", ""))}
             if not str(eda.get("lcsc_id") or "").strip() and component_type in physical_types:
                 missing_lcsc.append(entry)
@@ -8102,7 +8192,7 @@ def pcb_export_readiness(project: dict[str, Any], modules: dict[str, dict[str, A
                 missing_footprint.append(entry)
             elif footprint and get_footprint(index, footprint) is None:
                 unknown_library_part.append({**entry, "footprint": footprint})
-    ready = not (
+    ready = library_error is None and not (
         missing_lcsc or missing_refdes or missing_symbol or missing_footprint or unknown_library_part
     )
     hints: list[str] = []
@@ -8120,6 +8210,8 @@ def pcb_export_readiness(project: dict[str, Any], modules: dict[str, dict[str, A
         hints.append(
             "eda.symbol/eda.footprint must resolve against the bundled KiCad library index."
         )
+    if library_error is not None:
+        hints.append(f"Bundled KiCad library is unavailable: {library_error}")
     return {
         "ready": ready,
         "missing_lcsc_id": missing_lcsc,
@@ -8127,6 +8219,7 @@ def pcb_export_readiness(project: dict[str, Any], modules: dict[str, dict[str, A
         "missing_symbol": missing_symbol,
         "missing_footprint": missing_footprint,
         "unknown_library_part": unknown_library_part,
+        "library_error": library_error,
         "hints": hints,
     }
 
@@ -9000,6 +9093,11 @@ def build_parser() -> argparse.ArgumentParser:
     kicad_lib_get.add_argument("--symbol", default="")
     kicad_lib_get.add_argument("--footprint", default="")
 
+    kicad_symbol_ir = subparsers.add_parser(
+        "kicad-symbol-ir", help="Resolve bundled KiCad symbols into renderer-neutral IR."
+    )
+    kicad_symbol_ir.add_argument("--symbol", action="append", required=True)
+
     subparsers.add_parser(
         "kicad-lib-reindex", help="Force rebuild of the KiCad library index cache."
     )
@@ -9669,6 +9767,10 @@ def main() -> int:
                     "description": entry.get("description", ""),
                     "default_footprint": entry.get("default_footprint", ""),
                     "pin_count": len(entry.get("pins", [])),
+                    "unit_count": int(entry.get("unit_count", 1) or 1),
+                    "selectable_units": [int(unit.get("unit", 1)) for unit in entry.get("units", [])] or [1],
+                    "requires_unit": int(entry.get("unit_count", 1) or 1) > 1,
+                    "placeable": True,
                 }
                 for entry in search_symbols(index, args.query, limit=args.limit)
             ]
@@ -9689,6 +9791,11 @@ def main() -> int:
                 if footprint is None:
                     raise ValueError(f"footprint not found: {args.footprint}")
                 result = {"ok": True, "footprint": footprint}
+        elif args.command == "kicad-symbol-ir":
+            from kicad_library import build_symbol_ir_bundle, load_index, resolve_lib_root
+
+            result = build_symbol_ir_bundle(load_index(resolve_lib_root()), list(args.symbol))
+            result["ok"] = not result["diagnostics"]
         elif args.command == "kicad-lib-reindex":
             from kicad_library import load_index, resolve_lib_root
 

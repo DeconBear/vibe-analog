@@ -243,6 +243,20 @@ subset (`kicad-lib-search` / `kicad-lib-get` to browse):
 - Pins come from the symbol: `id` = pin number, `name` = pin name (VBAT,
   PA13, ...), `side`/`order` mirror the KiCad symbol geometry so the block
   roughly keeps the symbol shape; `block.width`/`height` follow the pin count.
+- `kicad-lib-search` reports `unit_count`, `selectable_units`, and
+  `requires_unit`. Multi-unit placement requires an explicit `unit`. Place
+  unit 1 first (or supply a new `package_id`); later units reference that
+  module-local package. A package cannot contain the same unit twice and all
+  units share symbol, refdes, footprint, value, and material fields.
+- `kicad-symbol-ir --symbol Library:Cell` resolves one or more used symbols to
+  an `actoviq.symbol-ir-bundle.v1`. Definitions use 0.127 mm per local unit
+  with Y down and contain flattened unit/variant graphics, pins, properties,
+  bounds, source hash, and unsupported-node diagnostics. The desktop batches
+  this through `resolveKicadSymbolIr(symbolIds)` and does not persist IR in the
+  module/project source of truth.
+- `Device:Crystal*` and `Device:Resonator*` remain structured `BLOCK`
+  components for the shared export pipeline, but the desktop editor projects
+  them as native crystal glyphs (including frequency value) rather than boxes.
 - Symbols mapping to SPICE primitives place native components instead of
   blocks: `Device:R` → `type: "R"`, `Device:C` → `type: "C"`, `Device:LED` →
   `type: "D"`. These keep the netlist pin idiom (`a`/`b`, D uses `a`=anode /

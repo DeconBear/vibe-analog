@@ -9,13 +9,22 @@ index with on-disk caching keyed by source file fingerprints.
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import os
 import re
 import sys
+import tempfile
+from copy import deepcopy
 from pathlib import Path
 
-_INDEX_VERSION = 1
-_UNIT_SUFFIX_RE = re.compile(r"_\d+_\d+$")
+_INDEX_VERSION = 4
+SYMBOL_IR_SCHEMA = "actoviq.symbol-ir.v1"
+SYMBOL_IR_BUNDLE_SCHEMA = "actoviq.symbol-ir-bundle.v1"
+_MM_PER_INTERNAL_UNIT = 0.127
+_IR_MEMORY_CACHE: dict[str, dict] = {}
+_IR_CACHE_VERSION = 2
+_UNIT_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
 
 _DEFAULT_CACHE = (
     Path.home()
@@ -106,20 +115,20 @@ def parse_sexpr(text: str) -> SList:
 
 
 def _head(node) -> str:
-    if isinstance(node, SList) and node and isinstance(node[0], str):
+    if isinstance(node, list) and node and isinstance(node[0], str):
         return node[0]
     return ""
 
 
 def _find(node, tag: str):
     for child in node:
-        if isinstance(child, SList) and _head(child) == tag:
+        if isinstance(child, list) and _head(child) == tag:
             return child
     return None
 
 
 def _find_all(node, tag: str):
-    return [c for c in node if isinstance(c, SList) and _head(c) == tag]
+    return [c for c in node if isinstance(c, list) and _head(c) == tag]
 
 
 def _float(value, default: float = 0.0) -> float:
@@ -175,6 +184,95 @@ def _extract_pins(symbol_node) -> list:
     return pins
 
 
+def _extract_unit_pins(symbol_node) -> list:
+    units: dict[int, list] = {}
+    for subunit in _find_all(symbol_node, "symbol"):
+        name = str(subunit[1]) if len(subunit) > 1 else ""
+        match = _UNIT_SUFFIX_RE.search(name)
+        if match is None or int(match.group(1)) <= 0:
+            continue
+        unit = int(match.group(1))
+        pins = units.setdefault(unit, [])
+        seen = {str(pin.get("number", "")) for pin in pins}
+        for pin in _find_all(subunit, "pin"):
+            if len(pin) < 3:
+                continue
+            at = _find(pin, "at")
+            length = _find(pin, "length")
+            name_node = _find(pin, "name")
+            number_node = _find(pin, "number")
+            number = number_node[1] if number_node is not None and len(number_node) > 1 else ""
+            if number in seen:
+                continue
+            seen.add(number)
+            angle = _float(at[3]) if at is not None and len(at) > 3 else 0.0
+            pins.append({
+                "number": number,
+                "name": name_node[1] if name_node is not None and len(name_node) > 1 else "",
+                "etype": pin[1],
+                "shape": pin[2],
+                "x": _float(at[1]) if at is not None and len(at) > 1 else 0.0,
+                "y": _float(at[2]) if at is not None and len(at) > 2 else 0.0,
+                "angle": angle,
+                "orientation": {0: "R", 90: "U", 180: "L", 270: "D"}.get(int(angle) % 360, "R"),
+                "length": _float(length[1]) if length is not None and len(length) > 1 else 0.0,
+            })
+    return [{"unit": unit, "pins": pins} for unit, pins in sorted(units.items())]
+
+
+def _unit_count(symbol_node) -> int:
+    units = {
+        int(match.group(1))
+        for unit in _find_all(symbol_node, "symbol")
+        if len(unit) > 1
+        and (match := _UNIT_SUFFIX_RE.search(str(unit[1])))
+        and int(match.group(1)) > 0
+    }
+    return len(units) or 1
+
+
+def flatten_symbol_node(symbols: dict[str, list], cell: str, stack: tuple[str, ...] = ()) -> list:
+    """Flatten one KiCad symbol's ``extends`` chain for index, IR, and export."""
+    if cell in stack:
+        raise ValueError(f"cyclic KiCad symbol inheritance: {' -> '.join((*stack, cell))}")
+    node = symbols.get(cell)
+    if node is None:
+        raise ValueError(f"KiCad symbol {cell!r} not found in bundled library")
+    result = deepcopy(node)
+    extends = _find_all(result, "extends")
+    if not extends:
+        return result
+    if len(extends) != 1 or len(extends[0]) < 2 or isinstance(extends[0][1], list):
+        raise ValueError(f"KiCad symbol {cell!r} has a malformed extends clause")
+    parent_name = str(extends[0][1])
+    parent = flatten_symbol_node(symbols, parent_name, (*stack, cell))
+    result = [child for child in result if _head(child) != "extends"]
+    present_heads = {_head(child) for child in result[2:] if isinstance(child, list)}
+    present_properties = {
+        str(child[1])
+        for child in _find_all(result, "property")
+        if len(child) >= 2 and not isinstance(child[1], list)
+    }
+    for child in parent[2:]:
+        if not isinstance(child, list):
+            continue
+        head = _head(child)
+        if head == "symbol":
+            subunit = deepcopy(child)
+            subunit_name = str(subunit[1])
+            if not subunit_name.startswith(parent_name):
+                raise ValueError(f"KiCad symbol {parent_name!r} has an unexpected subunit {subunit_name!r}")
+            subunit[1] = cell + subunit_name[len(parent_name):]
+            result.append(subunit)
+        elif head == "property":
+            if len(child) >= 2 and not isinstance(child[1], list) and str(child[1]) not in present_properties:
+                result.append(deepcopy(child))
+        elif head and head not in present_heads:
+            result.append(deepcopy(child))
+            present_heads.add(head)
+    return result
+
+
 def _index_symbol_file(path: Path, warnings: list) -> dict:
     lib = path.stem
     text = path.read_text(encoding="utf-8")
@@ -189,53 +287,23 @@ def _index_symbol_file(path: Path, warnings: list) -> dict:
             if not _UNIT_SUFFIX_RE.search(name):
                 nodes[name] = node
 
-    # Resolve (extends ...) inheritance: child properties/pins win, missing
-    # values fall back to the parent chain.
-    resolved: dict = {}
-
-    def resolve(name: str, stack: frozenset):
-        if name in resolved:
-            return resolved[name]
-        node = nodes.get(name)
-        if node is None or name in stack:
-            return None
-        parent = None
-        extends = _find(node, "extends")
-        if extends is not None:
-            parent_name = extends[1] if len(extends) > 1 else ""
-            parent = resolve(parent_name, stack | {name})
-            if parent is None:
-                warnings.append(
-                    f"{lib}:{name} extends unresolvable parent {parent_name}; skipped"
-                )
-                resolved[name] = None
-                return None
-        info = {}
-        for key, prop in (
-            ("description", "Description"),
-            ("keywords", "ki_keywords"),
-            ("default_footprint", "Footprint"),
-            ("datasheet", "Datasheet"),
-        ):
-            value = _property(node, prop)
-            if not value and parent is not None:
-                value = parent[key]
-            info[key] = value
-        pins = _extract_pins(node)
-        if not pins and parent is not None:
-            pins = parent["pins"]
-        info["pins"] = pins
-        info["ancestors"] = ([parent_name] + parent["ancestors"]) if parent is not None else []
-        resolved[name] = info
-        return info
-
     entries = {}
     for name, node in nodes.items():
-        info = resolve(name, frozenset())
-        if info is None:
+        try:
+            flattened = flatten_symbol_node(nodes, name)
+        except ValueError as exc:
+            warnings.append(f"{lib}:{name}: {exc}; skipped")
             continue
+        ancestors = []
+        ancestor_node = node
+        while (extends := _find(ancestor_node, "extends")) is not None and len(extends) > 1:
+            ancestor_name = str(extends[1])
+            ancestors.append(ancestor_name)
+            ancestor_node = nodes.get(ancestor_name)
+            if ancestor_node is None:
+                break
         raw = text[node.start : node.end]
-        for ancestor in info["ancestors"]:
+        for ancestor in ancestors:
             ancestor_node = nodes.get(ancestor)
             if ancestor_node is not None:
                 raw += "\n" + text[ancestor_node.start : ancestor_node.end]
@@ -243,14 +311,349 @@ def _index_symbol_file(path: Path, warnings: list) -> dict:
             "lib": lib,
             "name": name,
             "id": f"{lib}:{name}",
-            "description": info["description"],
-            "keywords": info["keywords"],
-            "default_footprint": info["default_footprint"],
-            "datasheet": info["datasheet"],
-            "pins": info["pins"],
+            "description": _property(flattened, "Description"),
+            "keywords": _property(flattened, "ki_keywords"),
+            "default_footprint": _property(flattened, "Footprint"),
+            "datasheet": _property(flattened, "Datasheet"),
+            "pins": _extract_pins(flattened),
+            "units": _extract_unit_pins(flattened),
+            "unit_count": _unit_count(flattened),
             "raw": raw,
         }
     return entries
+
+
+def _ir_number(value, *, invert: bool = False) -> float:
+    number = _float(value) / _MM_PER_INTERNAL_UNIT
+    return round(-number if invert else number, 6)
+
+
+def _ir_point(node, tag: str) -> dict | None:
+    point = _find(node, tag)
+    if point is None or len(point) < 3:
+        return None
+    return {"x": _ir_number(point[1]), "y": _ir_number(point[2], invert=True)}
+
+
+def _ir_effects(node) -> dict:
+    effects = _find(node, "effects")
+    if effects is None:
+        return {"font_size": 10.0, "justify": [], "bold": False, "italic": False, "visible": True}
+    font = _find(effects, "font")
+    size = _find(font, "size") if font is not None else None
+    justify = _find(effects, "justify")
+    hidden = _find(effects, "hide")
+    return {
+        "font_size": _ir_number(size[1]) if size is not None and len(size) > 1 else 10.0,
+        "justify": [str(value) for value in justify[1:] if not isinstance(value, list)] if justify else [],
+        "bold": _find(font, "bold") is not None if font is not None else False,
+        "italic": _find(font, "italic") is not None if font is not None else False,
+        "visible": hidden is None,
+    }
+
+
+def _ir_stroke(node) -> dict:
+    stroke = _find(node, "stroke")
+    width = _find(stroke, "width") if stroke is not None else None
+    style = _find(stroke, "type") if stroke is not None else None
+    return {
+        "width": _ir_number(width[1]) if width is not None and len(width) > 1 else 0.0,
+        "style": str(style[1]) if style is not None and len(style) > 1 else "default",
+    }
+
+
+def _ir_fill(node) -> str:
+    fill = _find(node, "fill")
+    fill_type = _find(fill, "type") if fill is not None else None
+    return str(fill_type[1]) if fill_type is not None and len(fill_type) > 1 else "none"
+
+
+def _ir_graphic(node) -> dict | None:
+    kind = _head(node)
+    common = {"stroke": _ir_stroke(node), "fill": _ir_fill(node)}
+    if kind == "polyline":
+        pts = _find(node, "pts")
+        points = [] if pts is None else [
+            {"x": _ir_number(point[1]), "y": _ir_number(point[2], invert=True)}
+            for point in _find_all(pts, "xy") if len(point) >= 3
+        ]
+        return {"kind": kind, "points": points, **common} if len(points) >= 2 else None
+    if kind == "rectangle":
+        start, end = _ir_point(node, "start"), _ir_point(node, "end")
+        return {"kind": kind, "start": start, "end": end, **common} if start and end else None
+    if kind == "circle":
+        center = _ir_point(node, "center")
+        radius = _find(node, "radius")
+        return {
+            "kind": kind,
+            "center": center,
+            "radius": _ir_number(radius[1]),
+            **common,
+        } if center and radius is not None and len(radius) > 1 else None
+    if kind == "arc":
+        start, mid, end = _ir_point(node, "start"), _ir_point(node, "mid"), _ir_point(node, "end")
+        return {"kind": kind, "start": start, "mid": mid, "end": end, **common} if start and mid and end else None
+    if kind == "text":
+        at = _find(node, "at")
+        if len(node) < 2 or at is None or len(at) < 3:
+            return None
+        return {
+            "kind": kind,
+            "text": str(node[1]),
+            "at": {"x": _ir_number(at[1]), "y": _ir_number(at[2], invert=True)},
+            "angle": (-_float(at[3])) % 360 if len(at) > 3 else 0.0,
+            "effects": _ir_effects(node),
+        }
+    return None
+
+
+def _ir_pin(node) -> dict | None:
+    if len(node) < 3:
+        return None
+    at = _find(node, "at")
+    length = _find(node, "length")
+    name = _find(node, "name")
+    number = _find(node, "number")
+    if at is None or len(at) < 3 or number is None or len(number) < 2:
+        return None
+    return {
+        "number": str(number[1]),
+        "name": str(name[1]) if name is not None and len(name) > 1 else "",
+        "electrical_type": str(node[1]),
+        "shape": str(node[2]),
+        "at": {"x": _ir_number(at[1]), "y": _ir_number(at[2], invert=True)},
+        "angle": (-_float(at[3])) % 360 if len(at) > 3 else 0.0,
+        "length": _ir_number(length[1]) if length is not None and len(length) > 1 else 0.0,
+        "name_effects": _ir_effects(name) if name is not None else _ir_effects([]),
+        "number_effects": _ir_effects(number),
+    }
+
+
+def _ir_property(symbol, property_name: str) -> dict | None:
+    for prop in _find_all(symbol, "property"):
+        if len(prop) < 3 or str(prop[1]) != property_name:
+            continue
+        at = _find(prop, "at")
+        if at is None or len(at) < 3:
+            return None
+        return {
+            "at": {"x": _ir_number(at[1]), "y": _ir_number(at[2], invert=True)},
+            "angle": (-_float(at[3])) % 360 if len(at) > 3 else 0.0,
+            "effects": _ir_effects(prop),
+        }
+    return None
+
+
+def _has_atom(node, value: str) -> bool:
+    return isinstance(node, list) and any(not isinstance(child, list) and str(child) == value for child in node[1:])
+
+
+def _ir_bounds(graphics: list, pins: list) -> dict:
+    points: list[dict] = []
+    for graphic in graphics:
+        kind = graphic["kind"]
+        if kind == "polyline":
+            points.extend(graphic["points"])
+        elif kind == "rectangle":
+            points.extend([graphic["start"], graphic["end"]])
+        elif kind == "circle":
+            center, radius = graphic["center"], graphic["radius"]
+            points.extend([
+                {"x": center["x"] - radius, "y": center["y"] - radius},
+                {"x": center["x"] + radius, "y": center["y"] + radius},
+            ])
+        elif kind == "arc":
+            start, mid, end = graphic["start"], graphic["mid"], graphic["end"]
+            points.extend([start, mid, end])
+            determinant = 2 * (
+                start["x"] * (mid["y"] - end["y"])
+                + mid["x"] * (end["y"] - start["y"])
+                + end["x"] * (start["y"] - mid["y"])
+            )
+            if abs(determinant) > 1e-9:
+                start_square = start["x"] ** 2 + start["y"] ** 2
+                mid_square = mid["x"] ** 2 + mid["y"] ** 2
+                end_square = end["x"] ** 2 + end["y"] ** 2
+                center_x = (
+                    start_square * (mid["y"] - end["y"])
+                    + mid_square * (end["y"] - start["y"])
+                    + end_square * (start["y"] - mid["y"])
+                ) / determinant
+                center_y = (
+                    start_square * (end["x"] - mid["x"])
+                    + mid_square * (start["x"] - end["x"])
+                    + end_square * (mid["x"] - start["x"])
+                ) / determinant
+                radius = math.hypot(start["x"] - center_x, start["y"] - center_y)
+                start_angle = math.atan2(start["y"] - center_y, start["x"] - center_x)
+                clockwise = lambda point: (
+                    math.atan2(point["y"] - center_y, point["x"] - center_x) - start_angle
+                ) % (math.pi * 2)
+                end_delta = clockwise(end)
+                sweep_clockwise = clockwise(mid) <= end_delta
+                for angle in (0, math.pi / 2, math.pi, math.pi * 3 / 2):
+                    delta = (angle - start_angle) % (math.pi * 2)
+                    on_arc = delta <= end_delta if sweep_clockwise else delta >= end_delta
+                    if on_arc:
+                        points.append({
+                            "x": center_x + math.cos(angle) * radius,
+                            "y": center_y + math.sin(angle) * radius,
+                        })
+        elif kind == "text":
+            font_size = graphic["effects"]["font_size"]
+            half_width = max(font_size / 2, len(graphic["text"]) * font_size * 0.3)
+            half_height = font_size * 0.6
+            radians = graphic["angle"] * math.pi / 180.0
+            for local_x, local_y in ((-half_width, -half_height), (half_width, -half_height), (half_width, half_height), (-half_width, half_height)):
+                points.append({
+                    "x": graphic["at"]["x"] + local_x * math.cos(radians) - local_y * math.sin(radians),
+                    "y": graphic["at"]["y"] + local_x * math.sin(radians) + local_y * math.cos(radians),
+                })
+    for pin in pins:
+        points.append(pin["at"])
+        radians = pin["angle"] * 3.141592653589793 / 180.0
+        points.append({
+            "x": pin["at"]["x"] + math.cos(radians) * pin["length"],
+            "y": pin["at"]["y"] + math.sin(radians) * pin["length"],
+        })
+    if not points:
+        return {"minX": -40.0, "minY": -30.0, "maxX": 40.0, "maxY": 30.0}
+    return {
+        "minX": min(point["x"] for point in points),
+        "minY": min(point["y"] for point in points),
+        "maxX": max(point["x"] for point in points),
+        "maxY": max(point["y"] for point in points),
+    }
+
+
+def build_symbol_ir(index: dict, symbol_id: str) -> dict:
+    """Build one flattened, renderer-neutral symbol definition on demand."""
+    entry = get_symbol(index, symbol_id)
+    if entry is None:
+        raise ValueError(f"symbol not found: {symbol_id}")
+    content_hash = hashlib.sha256(str(entry.get("raw", "")).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha256(
+        f"{SYMBOL_IR_SCHEMA}:{_IR_CACHE_VERSION}:{content_hash}".encode("utf-8")
+    ).hexdigest()
+    cached = _IR_MEMORY_CACHE.get(cache_key)
+    if cached is not None:
+        return json.loads(json.dumps(cached))
+    cache_path = Path(tempfile.gettempdir()) / "actoviq-symbol-ir-v1" / f"{cache_key}.json"
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if cached.get("schema") == SYMBOL_IR_SCHEMA and cached.get("id") == symbol_id:
+            _IR_MEMORY_CACHE[cache_key] = cached
+            return json.loads(json.dumps(cached))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    library, _, cell = symbol_id.partition(":")
+    from kicad_lib_embed import _flattened_symbol
+
+    symbol = _flattened_symbol(library, cell)
+    subunits: list[tuple[int, int, list]] = []
+    for node in _find_all(symbol, "symbol"):
+        name = str(node[1]) if len(node) > 1 else ""
+        match = _UNIT_SUFFIX_RE.search(name)
+        if match:
+            subunits.append((int(match.group(1)), int(match.group(2)), node))
+    units = sorted({unit for unit, _, _ in subunits if unit > 0}) or [1]
+    variants = []
+    diagnostics = []
+    supported = {"polyline", "rectangle", "circle", "arc", "text", "pin"}
+    for unit in units:
+        conversions = sorted({convert for candidate, convert, _ in subunits if candidate in {0, unit} and convert > 0}) or [1]
+        for variant in conversions:
+            selected = [node for candidate, convert, node in subunits if candidate in {0, unit} and convert in {0, variant}]
+            graphics, pins, unsupported = [], [], []
+            for node in selected:
+                for child in node[2:]:
+                    if not isinstance(child, list):
+                        continue
+                    kind = _head(child)
+                    if kind == "pin":
+                        pin = _ir_pin(child)
+                        if pin is not None and all(existing["number"] != pin["number"] for existing in pins):
+                            pins.append(pin)
+                        elif pin is None:
+                            unsupported.append(kind)
+                    elif kind in supported:
+                        graphic = _ir_graphic(child)
+                        if graphic is not None:
+                            graphics.append(graphic)
+                        else:
+                            unsupported.append(kind)
+                    elif kind:
+                        unsupported.append(kind)
+            if unsupported:
+                diagnostics.append({
+                    "code": "symbol_ir_unsupported",
+                    "unit": unit,
+                    "variant": variant,
+                    "message": f"unsupported KiCad symbol nodes: {', '.join(sorted(set(unsupported)))}",
+                })
+            variants.append({
+                "unit": unit,
+                "variant": variant,
+                "renderable": not unsupported,
+                "graphics": graphics,
+                "pins": pins,
+                "bounds": _ir_bounds(graphics, pins),
+            })
+    pin_names = _find(symbol, "pin_names")
+    pin_numbers = _find(symbol, "pin_numbers")
+    manifest_path = resolve_lib_root() / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    result = {
+        "schema": SYMBOL_IR_SCHEMA,
+        "id": symbol_id,
+        "source": {
+            "format": "kicad",
+            "library": library,
+            "symbol": cell,
+            "version": str(source.get("ref", "")),
+            "content_hash": content_hash,
+        },
+        "unit_count": len(units),
+        "pin_names": {
+            "visible": not (pin_names is not None and (_find(pin_names, "hide") is not None or _has_atom(pin_names, "hide"))),
+            "offset": _ir_number((_find(pin_names, "offset") or [None, 0])[1]) if pin_names is not None else 0.0,
+        },
+        "pin_numbers": {"visible": not (pin_numbers is not None and (_find(pin_numbers, "hide") is not None or _has_atom(pin_numbers, "hide")))},
+        "properties": {
+            "reference": _ir_property(symbol, "Reference"),
+            "value": _ir_property(symbol, "Value"),
+        },
+        "variants": variants,
+        "diagnostics": diagnostics,
+    }
+    _IR_MEMORY_CACHE[cache_key] = result
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(cache_path)
+    except OSError:
+        pass
+    return json.loads(json.dumps(result))
+
+
+def build_symbol_ir_bundle(index: dict, symbol_ids: list[str]) -> dict:
+    definitions, diagnostics = {}, []
+    for symbol_id in dict.fromkeys(symbol_ids):
+        try:
+            definitions[symbol_id] = build_symbol_ir(index, symbol_id)
+        except Exception as exc:
+            diagnostics.append({
+                "code": "symbol_ir_missing",
+                "symbol_id": symbol_id,
+                "message": str(exc) or exc.__class__.__name__,
+            })
+    return {
+        "schema": SYMBOL_IR_BUNDLE_SCHEMA,
+        "definitions": definitions,
+        "diagnostics": diagnostics,
+    }
 
 
 def _index_footprint_file(path: Path, lib: str) -> dict:
@@ -337,8 +740,12 @@ def load_index(lib_root: Path, cache_path: Path | None = None, force: bool = Fal
     if not force and cache_path.is_file():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("fingerprint") == fingerprint:
-                index = cached["index"]
+            index = cached["index"]
+            if (
+                cached.get("fingerprint") == fingerprint
+                and index.get("version") == _INDEX_VERSION
+                and index.get("lib_root") == str(lib_root)
+            ):
                 index["cache_hit"] = True
                 index["cache_path"] = str(cache_path)
                 return index

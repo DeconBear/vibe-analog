@@ -9,6 +9,9 @@ import {
   COMPONENT_NAME_FONT_SIZE,
   COMPONENT_VALUE_FONT_SIZE,
   displayComponentValue,
+  displayComponentReference,
+  crystalPinBodyWorld,
+  isCrystalComponent,
   isPmosComponent,
   isMosBodyPin,
   isGroundPort,
@@ -38,6 +41,11 @@ import {
   type WireSelectionScope,
 } from '../schematic-core/selection/netSelection';
 import type { LiveErcDiagnostic } from '../schematic-core/diagnostics/liveErc';
+import {
+  resolveSymbolDefinition,
+  resolveSymbolVariant,
+  type SymbolIrGraphic,
+} from './symbolIr';
 
 const WIRE_COLOR = '#17851f';
 const SYMBOL_COLOR = '#a00012';
@@ -888,10 +896,10 @@ const ComponentSymbol = memo(function ComponentSymbol({ component, placements, s
           pointerEvents="none"
           data-testid="schematic-component-name-label"
         >
-          {component.name}
+          {displayComponentReference(component)}
         </text>
       ) : null}
-      {component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND' ? (
+      {(component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND') || isCrystalComponent(component) || Boolean(resolveSymbolVariant(component)) ? (
         <text
           x={valueLabel.x}
           y={valueLabel.y}
@@ -945,10 +953,10 @@ function PlaceGhostSymbol({ component }: { component: CircuitComponent }) {
           strokeWidth="3"
           paintOrder="stroke"
         >
-          {component.name}
+          {displayComponentReference(component)}
         </text>
       ) : null}
-      {component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND' ? (
+      {(component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND') || Boolean(resolveSymbolVariant(component)) ? (
         <text
           x={labels.value.x}
           y={labels.value.y}
@@ -1035,6 +1043,18 @@ function ComponentSelectionHandles({ bounds }: { bounds: ReturnType<typeof compo
 }
 
 function LeadLines({ component }: { component: CircuitComponent }) {
+  if (resolveSymbolVariant(component)) return null;
+  if (isCrystalComponent(component)) {
+    return (
+      <g stroke={SYMBOL_COLOR} strokeWidth="2.2" pointerEvents="none">
+        {component.pins.map((pin, index) => {
+          const endpoint = pinWorld(component, pin, index);
+          const body = crystalPinBodyWorld(component, pin, index);
+          return <line key={`crystal-lead-${pin.id}`} x1={endpoint.x} y1={endpoint.y} x2={body.x} y2={body.y} />;
+        })}
+      </g>
+    );
+  }
   if ((component.type === 'BLOCK' || component.type === 'MODULE')) {
     return (
       <g stroke={SYMBOL_COLOR} strokeWidth="2.2" pointerEvents="none" data-testid="schematic-block-leads">
@@ -1071,6 +1091,30 @@ function LeadLines({ component }: { component: CircuitComponent }) {
 function SymbolBody({ component }: { component: CircuitComponent }) {
   const { x, y } = component.position;
   const rotation = component.rotation ?? 0;
+  if (isCrystalComponent(component)) {
+    const groundedCase = component.pins.length > 2;
+    return (
+      <g
+        transform={`rotate(${rotation} ${x} ${y})`}
+        fill="none"
+        stroke={SYMBOL_COLOR}
+        strokeWidth="2.4"
+        pointerEvents="none"
+        data-testid="schematic-symbol-body"
+        data-symbol-kind="crystal"
+      >
+        {groundedCase ? <rect x={x - 25} y={y - 30} width="50" height="60" rx="3" fill="#fff" /> : null}
+        <line x1={x - 12} y1={y - 24} x2={x - 12} y2={y + 24} />
+        <line x1={x + 12} y1={y - 24} x2={x + 12} y2={y + 24} />
+        <rect x={x - 5} y={y - 18} width="10" height="36" fill="#fff" />
+      </g>
+    );
+  }
+  const symbol = resolveSymbolVariant(component);
+  const definition = resolveSymbolDefinition(component);
+  if (symbol && definition) {
+    return <GenericIrSymbol component={component} graphics={symbol.graphics} />;
+  }
   if (component.type === 'R') {
     return (
       <g transform={`rotate(${rotation} ${x} ${y})`} pointerEvents="none" data-testid="schematic-symbol-body" data-symbol-kind="resistor">
@@ -1286,6 +1330,112 @@ function SymbolBody({ component }: { component: CircuitComponent }) {
           {component.type}
         </text>
       )}
+    </g>
+  );
+}
+
+function irStrokeWidth(graphic: Exclude<SymbolIrGraphic, { kind: 'text' }>): number {
+  return graphic.stroke.width > 0 ? Math.max(1.2, graphic.stroke.width) : SYMBOL_STROKE;
+}
+
+function irFill(graphic: Exclude<SymbolIrGraphic, { kind: 'text' }>): string {
+  if (graphic.fill === 'background') return '#ffffff';
+  if (graphic.fill === 'outline') return SYMBOL_COLOR;
+  return 'none';
+}
+
+function irArcPath(graphic: Extract<SymbolIrGraphic, { kind: 'arc' }>): string {
+  const { start, mid, end } = graphic;
+  const determinant = 2 * (
+    start.x * (mid.y - end.y)
+    + mid.x * (end.y - start.y)
+    + end.x * (start.y - mid.y)
+  );
+  if (Math.abs(determinant) < 1e-6) return `M ${start.x} ${start.y} L ${mid.x} ${mid.y} L ${end.x} ${end.y}`;
+  const startSquare = start.x * start.x + start.y * start.y;
+  const midSquare = mid.x * mid.x + mid.y * mid.y;
+  const endSquare = end.x * end.x + end.y * end.y;
+  const cx = (
+    startSquare * (mid.y - end.y)
+    + midSquare * (end.y - start.y)
+    + endSquare * (start.y - mid.y)
+  ) / determinant;
+  const cy = (
+    startSquare * (end.x - mid.x)
+    + midSquare * (start.x - end.x)
+    + endSquare * (mid.x - start.x)
+  ) / determinant;
+  const radius = Math.hypot(start.x - cx, start.y - cy);
+  const turn = (from: CircuitPosition, to: CircuitPosition) => {
+    const value = Math.atan2(to.y - cy, to.x - cx) - Math.atan2(from.y - cy, from.x - cx);
+    return (value + Math.PI * 2) % (Math.PI * 2);
+  };
+  const clockwiseToMid = turn(start, mid);
+  const clockwiseToEnd = turn(start, end);
+  const sweep = clockwiseToMid <= clockwiseToEnd ? 1 : 0;
+  const span = sweep ? clockwiseToEnd : (Math.PI * 2 - clockwiseToEnd) % (Math.PI * 2);
+  return `M ${start.x} ${start.y} A ${radius} ${radius} 0 ${span > Math.PI ? 1 : 0} ${sweep} ${end.x} ${end.y}`;
+}
+
+function GenericIrSymbol({ component, graphics }: {
+  component: CircuitComponent;
+  graphics: SymbolIrGraphic[];
+}) {
+  const symbol = resolveSymbolVariant(component);
+  const definition = resolveSymbolDefinition(component);
+  if (!symbol || !definition) return null;
+  const rotation = component.rotation ?? 0;
+  return (
+    <g
+      transform={`translate(${component.position.x} ${component.position.y}) rotate(${rotation})`}
+      pointerEvents="none"
+      data-testid="schematic-symbol-body"
+      data-symbol-kind="kicad-ir"
+      data-symbol-id={definition.id}
+      data-symbol-unit={symbol.unit}
+    >
+      {graphics.map((graphic, index) => {
+        if (graphic.kind === 'polyline') return (
+          <polyline key={index} points={graphic.points.map((point) => `${point.x},${point.y}`).join(' ')} fill={irFill(graphic)} stroke={SYMBOL_COLOR} strokeWidth={irStrokeWidth(graphic)} />
+        );
+        if (graphic.kind === 'rectangle') return (
+          <rect key={index} x={Math.min(graphic.start.x, graphic.end.x)} y={Math.min(graphic.start.y, graphic.end.y)} width={Math.abs(graphic.end.x - graphic.start.x)} height={Math.abs(graphic.end.y - graphic.start.y)} fill={irFill(graphic)} stroke={SYMBOL_COLOR} strokeWidth={irStrokeWidth(graphic)} />
+        );
+        if (graphic.kind === 'circle') return (
+          <circle key={index} cx={graphic.center.x} cy={graphic.center.y} r={graphic.radius} fill={irFill(graphic)} stroke={SYMBOL_COLOR} strokeWidth={irStrokeWidth(graphic)} />
+        );
+        if (graphic.kind === 'arc') return (
+          <path key={index} d={irArcPath(graphic)} fill={irFill(graphic)} stroke={SYMBOL_COLOR} strokeWidth={irStrokeWidth(graphic)} />
+        );
+        return graphic.effects.visible ? (
+          <text key={index} x={graphic.at.x} y={graphic.at.y} transform={`rotate(${graphic.angle} ${graphic.at.x} ${graphic.at.y})`} fontSize={graphic.effects.font_size} fontFamily={LABEL_FONT} fontWeight={graphic.effects.bold ? '700' : undefined} fontStyle={graphic.effects.italic ? 'italic' : undefined} fill={LABEL_COLOR}>{graphic.text}</text>
+        ) : null;
+      })}
+      {symbol.pins.map((pin) => {
+        const radians = pin.angle * Math.PI / 180;
+        const inner = {
+          x: pin.at.x + Math.cos(radians) * pin.length,
+          y: pin.at.y + Math.sin(radians) * pin.length,
+        };
+        const clock = pin.shape.includes('clock');
+        const inverted = pin.shape.includes('inverted');
+        const normalX = -Math.sin(radians) * 5;
+        const normalY = Math.cos(radians) * 5;
+        const nameOffset = definition.pin_names.offset || 6;
+        const nameAt = {
+          x: inner.x + Math.cos(radians) * nameOffset,
+          y: inner.y + Math.sin(radians) * nameOffset + pin.name_effects.font_size * 0.35,
+        };
+        return (
+          <g key={`ir-pin-${pin.number}`} data-pin-number={pin.number} data-pin-shape={pin.shape}>
+            <line x1={pin.at.x} y1={pin.at.y} x2={inner.x} y2={inner.y} stroke={SYMBOL_COLOR} strokeWidth={SYMBOL_STROKE} />
+            {clock ? <path d={`M ${inner.x} ${inner.y} L ${inner.x - Math.cos(radians) * 9 + normalX} ${inner.y - Math.sin(radians) * 9 + normalY} L ${inner.x - Math.cos(radians) * 9 - normalX} ${inner.y - Math.sin(radians) * 9 - normalY} Z`} fill="none" stroke={SYMBOL_COLOR} strokeWidth={SYMBOL_STROKE} /> : null}
+            {inverted ? <circle cx={inner.x} cy={inner.y} r="4" fill="#fff" stroke={SYMBOL_COLOR} strokeWidth={SYMBOL_STROKE} /> : null}
+            {definition.pin_names.visible && pin.name_effects.visible && pin.name && pin.name !== '~' ? <text x={nameAt.x} y={nameAt.y} textAnchor={Math.cos(radians) < -0.1 ? 'end' : Math.cos(radians) > 0.1 ? 'start' : 'middle'} fontSize={pin.name_effects.font_size} fontFamily={LABEL_FONT} fill={LABEL_COLOR}>{pin.name}</text> : null}
+            {definition.pin_numbers.visible && pin.number_effects.visible ? <text x={(pin.at.x + inner.x) / 2} y={(pin.at.y + inner.y) / 2 - 4} textAnchor="middle" fontSize={pin.number_effects.font_size} fontFamily={LABEL_FONT} fill={LABEL_COLOR}>{pin.number}</text> : null}
+          </g>
+        );
+      })}
     </g>
   );
 }

@@ -6,9 +6,11 @@ import {
   collectSchematicTextItems,
   componentBounds,
   createSchematicDocument,
+  deserializeSchematicDocument,
   endpointWorldPosition,
   hitEndpoint,
   isGroundPort,
+  isCrystalComponent,
   isPmosComponent,
   makePlacedComponent,
   normalizeConnectivity,
@@ -23,6 +25,9 @@ import {
   validateWireTopology,
 } from '../renderer/src/schematic/schematicDocument';
 import type { SchematicTextItem } from '../renderer/src/schematic/schematicDocumentImpl';
+import type { SymbolIrDefinition } from '../renderer/src/schematic/symbolIr';
+import { projectSchematicDocumentIncremental } from '../renderer/src/schematic-core/projection/facade';
+import { deriveLiveErc } from '../renderer/src/schematic-core/diagnostics/liveErc';
 import { junctions } from '../renderer/src/schematic/SchematicDocumentSvg';
 import { fixtures, moduleFixture, component, ldoPorts } from './lib/schematic-fixtures';
 
@@ -36,6 +41,134 @@ assertRouteEgressAvoidsOwnerBody();
 assertLegacyPortNormalization();
 assertWiredInferredPortPreserved();
 assertLabelPlacementAvoidsCollisions();
+assertCrystalLibraryGlyphProjection();
+assertGenericSymbolIrProjection();
+
+function assertGenericSymbolIrProjection() {
+  const definition: SymbolIrDefinition = {
+    schema: 'actoviq.symbol-ir.v1',
+    id: 'Switch:SW_Test',
+    source: { format: 'kicad', library: 'Switch', symbol: 'SW_Test', version: '8.0.9', content_hash: 'hash-a' },
+    unit_count: 1,
+    pin_names: { visible: true, offset: 6 },
+    pin_numbers: { visible: true },
+    properties: {
+      reference: { at: { x: 0, y: -30 }, angle: 0, effects: { font_size: 10, justify: [], bold: false, italic: false, visible: true } },
+      value: { at: { x: 0, y: 30 }, angle: 0, effects: { font_size: 10, justify: [], bold: false, italic: false, visible: true } },
+    },
+    variants: [{
+      unit: 1,
+      variant: 1,
+      renderable: true,
+      graphics: [
+        { kind: 'rectangle', start: { x: -20, y: -10 }, end: { x: 20, y: 10 }, stroke: { width: 2, style: 'default' }, fill: 'background' },
+        { kind: 'circle', center: { x: 0, y: 0 }, radius: 4, stroke: { width: 1, style: 'default' }, fill: 'none' },
+      ],
+      pins: [
+        { number: '1', name: 'A', electrical_type: 'passive', shape: 'line', at: { x: -40, y: 0 }, angle: 0, length: 20, name_effects: { font_size: 10, justify: [], bold: false, italic: false, visible: true }, number_effects: { font_size: 10, justify: [], bold: false, italic: false, visible: true } },
+        { number: '2', name: 'B', electrical_type: 'passive', shape: 'clock', at: { x: 40, y: 0 }, angle: 180, length: 20, name_effects: { font_size: 10, justify: [], bold: false, italic: false, visible: true }, number_effects: { font_size: 10, justify: [], bold: false, italic: false, visible: true } },
+      ],
+      bounds: { minX: -40, minY: -10, maxX: 40, maxY: 10 },
+    }],
+    diagnostics: [],
+  };
+  const component = {
+    id: 'sw1', type: 'BLOCK', name: 'SW1', value: 'SW_Test',
+    position: { x: 200, y: 160 }, rotation: 0,
+    pins: [
+      { id: '1', name: 'A', net: 'a' },
+      { id: '2', name: 'B', net: 'b' },
+    ],
+    eda: { symbol: definition.id, unit: 1, symbol_variant: 1, package_id: 'pkg_sw1' },
+  } as CircuitComponent;
+  for (const [rotation, expected] of [
+    [0, [{ x: 160, y: 160 }, { x: 240, y: 160 }]],
+    [90, [{ x: 200, y: 120 }, { x: 200, y: 200 }]],
+    [180, [{ x: 240, y: 160 }, { x: 160, y: 160 }]],
+    [270, [{ x: 200, y: 200 }, { x: 200, y: 120 }]],
+  ] as const) {
+    const document = createSchematicDocument(moduleFixture(`ir_${rotation}`, [{ ...component, rotation }]), {
+      autoLayout: false,
+      symbolDefinitions: { [definition.id]: definition },
+    });
+    const projected = document.module.components[0]!;
+    assert.deepEqual(projected.pins.map((pin, index) => pinWorld(projected, pin, index)), expected);
+    assert.equal(document.symbolInstances[0]?.status, 'resolved');
+    assert.equal(document.symbolDiagnostics.length, 0);
+    const roundTrip = deserializeSchematicDocument(serializeSchematicDocument(document));
+    assert.deepEqual(
+      roundTrip.module.components[0]!.pins.map((pin, index) => pinWorld(roundTrip.module.components[0]!, pin, index)),
+      expected,
+    );
+  }
+
+  const first = projectSchematicDocumentIncremental(
+    moduleFixture('ir_hash', [component]),
+    { autoLayout: false, symbolDefinitions: { [definition.id]: definition } },
+  );
+  const changedDefinition = { ...definition, source: { ...definition.source, content_hash: 'hash-b' } };
+  const invalidated = projectSchematicDocumentIncremental(
+    moduleFixture('ir_hash', [component]),
+    { autoLayout: false, symbolDefinitions: { [definition.id]: changedDefinition } },
+    first.snapshot,
+  );
+  assert.equal(invalidated.mode, 'full', 'definition hash change must invalidate incremental geometry');
+
+  const unsupported = {
+    ...definition,
+    variants: [{ ...definition.variants[0]!, renderable: false }],
+    diagnostics: [{ code: 'symbol_ir_unsupported', message: 'unsupported primitive', symbol_id: definition.id }],
+  } satisfies SymbolIrDefinition;
+  const fallback = createSchematicDocument(moduleFixture('ir_fallback', [component]), {
+    autoLayout: false,
+    symbolDefinitions: { [definition.id]: unsupported },
+  });
+  assert.equal(fallback.symbolInstances[0]?.status, 'unsupported');
+  assert.equal(fallback.symbolDiagnostics[0]?.code, 'symbol_ir_unsupported');
+  assert.ok(deriveLiveErc(fallback).some((diagnostic) => diagnostic.code === 'symbol_ir_unsupported'));
+  const mismatched = createSchematicDocument(moduleFixture('ir_pin_mismatch', [{
+    ...component,
+    pins: [...component.pins, { id: '9', name: 'EXTRA', net: 'extra' }],
+  }]), {
+    autoLayout: false,
+    symbolDefinitions: { [definition.id]: definition },
+  });
+  assert.equal(mismatched.symbolDiagnostics[0]?.code, 'symbol_ir_pin_mismatch');
+}
+
+function assertCrystalLibraryGlyphProjection() {
+  const crystal = {
+    id: 'y1',
+    type: 'BLOCK',
+    name: 'Y1',
+    value: '8 MHz',
+    position: { x: 240, y: 180 },
+    rotation: 0,
+    pins: [
+      { id: '1', name: '1', net: 'xin', side: 'left', order: 0 },
+      { id: '2', name: '2', net: 'xout', side: 'right', order: 0 },
+    ],
+    block: { width: 160, height: 120 },
+    eda: { symbol: 'Device:Crystal' },
+  } as CircuitComponent;
+  assert.equal(isCrystalComponent(crystal), true);
+  assert.equal(isCrystalComponent({ ...crystal, eda: { symbol: 'Device:Resonator' } }), true);
+  const document = createSchematicDocument(moduleFixture('crystal_glyph', [crystal]), { autoLayout: false });
+  assert.deepEqual(crystal.pins.map((pin, index) => pinWorld(document.module.components[0]!, pin, index)), [
+    { x: 188, y: 180 },
+    { x: 292, y: 180 },
+  ]);
+  assert.deepEqual(componentBounds(document.module.components[0]!), {
+    minX: 188,
+    minY: 148,
+    maxX: 292,
+    maxY: 212,
+  });
+  assert.ok(
+    collectSchematicTextItems(document).some((item) => item.key === 'component:y1:value' && item.text === '8 MHz'),
+    'library-backed crystal must render its frequency value outside the glyph',
+  );
+}
 
 function assertLabelPlacementAvoidsCollisions() {
   // Mirrors the STM32 mcu_core overlap report: a row of same-rail power labels

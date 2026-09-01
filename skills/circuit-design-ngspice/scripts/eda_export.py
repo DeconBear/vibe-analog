@@ -28,7 +28,13 @@ from eda_symbols import (
     prepare_component,
     resolve_symbol_map,
 )
-from kicad_lib_embed import find_footprint_file, footprint_pad_numbers, symbol_definition_lines, symbol_footprint, symbol_pin_positions
+from kicad_lib_embed import (
+    find_footprint_file,
+    footprint_pad_numbers,
+    symbol_definition_lines,
+    symbol_footprint,
+    symbol_pin_positions,
+)
 
 
 EDA_IR_SCHEMA = "actoviq.eda-ir.v1"
@@ -1226,7 +1232,7 @@ def _apply_library_symbol_pin_positions(nets: list[dict[str, Any]], components: 
         if not eda_symbol:
             continue
         library, _, cell = eda_symbol.partition(":")
-        pin_positions = symbol_pin_positions(library, cell)
+        pin_positions = symbol_pin_positions(library, cell, unit=int(eda.get("unit") or 1))
         position = component.get("position") or {}
         base_x = _kicad_snap_internal(float(position.get("x", 0)))
         base_y = _kicad_snap_internal(float(position.get("y", 0)))
@@ -4021,6 +4027,7 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
         binding = binding_for(symbol_map, "kicad", page["id"], component)
         _, _, lib_id = _kicad_binding_identity(binding)
         eda = component.get("eda") or {}
+        unit = int(eda.get("unit") or 1)
         physical = bool(eda.get("physical", str(component.get("type", "")).upper() in {"R", "C", "L", "D", "M", "Q"}))
         refdes = str(eda.get("refdes", component["name"]))
         kicad_rotation = (-int(component.get("rotation", 0))) % 360
@@ -4037,7 +4044,7 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
         reference_at, reference_effects = property_at("reference")
         value_at, value_effects = property_at("value")
         lines.extend([
-            f"  (symbol (lib_id {_sexpr_string(lib_id)}) (at {component_x*MM_PER_UNIT:.4f} {component_y*MM_PER_UNIT:.4f} {kicad_rotation}) (unit 1) (exclude_from_sim no) (in_bom {'yes' if physical else 'no'}) (on_board {'yes' if physical else 'no'}) (dnp no) (uuid {_stable_uuid(page['id'], component['id'])})",
+            f"  (symbol (lib_id {_sexpr_string(lib_id)}) (at {component_x*MM_PER_UNIT:.4f} {component_y*MM_PER_UNIT:.4f} {kicad_rotation}) (unit {unit}) (exclude_from_sim no) (in_bom {'yes' if physical else 'no'}) (on_board {'yes' if physical else 'no'}) (dnp no) (uuid {_stable_uuid(page['id'], component['id'])})",
             f"    (property \"Reference\" {_sexpr_string(refdes)} (at {reference_at[0]:.4f} {reference_at[1]:.4f} 0) {reference_effects})",
             f"    (property \"Value\" {_sexpr_string(component.get('value', ''))} (at {value_at[0]:.4f} {value_at[1]:.4f} 0) {value_effects})",
             f"    (property \"ACTOVIQ_ID\" {_sexpr_string(str(component.get('stable_id') or component['id']))} (at 0 0 0) (effects (font (size 1.27 1.27)) hide))",
@@ -4063,7 +4070,7 @@ def _kicad_page_lines(project_name: str, page: dict[str, Any], all_components: l
             lines.append(f"    (pin {_sexpr_string(target_pin)} (uuid {_stable_uuid(page['id'], component['id'], pin['id'])}))")
         lines.extend([
             "    (instances",
-            f"      (project {_sexpr_string(project_name)} (path {_sexpr_string('/' + page_uuid)} (reference {_sexpr_string(refdes)}) (unit 1)))",
+            f"      (project {_sexpr_string(project_name)} (path {_sexpr_string('/' + page_uuid)} (reference {_sexpr_string(refdes)}) (unit {unit})))",
             "    )",
             "  )",
         ])

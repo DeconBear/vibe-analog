@@ -1,5 +1,6 @@
 import type { CSSProperties } from 'react';
 import type { CircuitComponent, ProjectKind } from '../../../types';
+import type { SymbolIrDefinition } from '../../../schematic/symbolIr';
 
 export interface PdkDeviceCatalogDevice {
   device_id: string;
@@ -52,4 +53,8 @@ export interface ComponentParamFormProps extends ComponentParamFormContext {
   inputStyle: CSSProperties;
   hintStyle?: CSSProperties;
   onPatch: (patch: Partial<CircuitComponent>) => void;
+  symbolDefinition?: SymbolIrDefinition;
+  packageOptions?: Array<{ id: string; label: string }>;
+  onUnitChange?: (unit: number) => void;
+  onPackageChange?: (packageId: string) => void;
 }

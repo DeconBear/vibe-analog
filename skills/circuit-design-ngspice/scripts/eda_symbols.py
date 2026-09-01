@@ -233,13 +233,55 @@ def assign_refdes(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         page_id = str(page.get("id", ""))
         for index, component in enumerate(page.get("components", [])):
             ordered.append((page_id, str(component.get("id", "")), index, component))
-    for _, _, _, component in sorted(ordered, key=lambda item: item[:3]):
+    prepared_entries: list[tuple[str, str, int, dict[str, Any]]] = []
+    for page_id, component_id, index, component in sorted(ordered, key=lambda item: item[:3]):
         prepared = prepare_component(component)
         component.clear()
         component.update(prepared)
-        prefix = str(component["eda"]["refdes_prefix"])
-        counters[prefix] = counters.get(prefix, 0) + 1
-        component["eda"]["refdes"] = f"{prefix}{counters[prefix]}"
+        prepared_entries.append((page_id, component_id, index, component))
+
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for page_id, component_id, _, component in prepared_entries:
+        eda = component["eda"]
+        package_id = str(eda.get("package_id") or "").strip()
+        groups.setdefault((page_id, package_id or f"component:{component_id}"), []).append(component)
+
+    explicit_refdes: dict[tuple[str, str], str] = {}
+    used_refdes: dict[str, tuple[str, str]] = {}
+    for group_key, members in sorted(groups.items()):
+        explicit = {str(member["eda"].get("refdes") or "").strip() for member in members}
+        explicit.discard("")
+        if len(explicit) > 1:
+            raise ValueError(f"package {group_key[1]} has conflicting refdes values")
+        for field in ("symbol", "footprint", "lcsc_id", "mpn", "manufacturer"):
+            values = {str(member["eda"].get(field) or "").strip() for member in members}
+            values.discard("")
+            if len(values) > 1:
+                raise ValueError(f"package {group_key[1]} has conflicting {field} values")
+        units = [int(member["eda"].get("unit") or 1) for member in members]
+        if len(units) != len(set(units)):
+            raise ValueError(f"package {group_key[1]} contains duplicate symbol units")
+        if explicit:
+            refdes = next(iter(explicit))
+            owner = used_refdes.get(refdes.casefold())
+            if owner is not None and owner != group_key:
+                raise ValueError(f"duplicate refdes across physical packages: {refdes}")
+            used_refdes[refdes.casefold()] = group_key
+            explicit_refdes[group_key] = refdes
+
+    for group_key, members in sorted(groups.items()):
+        refdes = explicit_refdes.get(group_key)
+        if refdes is None:
+            prefix = str(members[0]["eda"]["refdes_prefix"])
+            counters[prefix] = counters.get(prefix, 0)
+            while True:
+                counters[prefix] += 1
+                refdes = f"{prefix}{counters[prefix]}"
+                if refdes.casefold() not in used_refdes:
+                    break
+            used_refdes[refdes.casefold()] = group_key
+        for member in members:
+            member["eda"]["refdes"] = refdes
     return pages
 
 
@@ -306,12 +348,15 @@ def _entry(table: Any, key: str) -> dict[str, Any] | None:
 
 
 def _merge_binding(binding: dict[str, Any], override: dict[str, Any], source_pins: set[str]) -> None:
+    original_identity = (binding.get("library"), binding.get("cell"))
     for field in ("library", "cell", "view"):
         if field in override:
             value = override[field]
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"symbol-map {field} must be a non-empty string")
             binding[field] = value.strip()
+    if (binding.get("library"), binding.get("cell")) != original_identity:
+        binding.pop("library_symbol", None)
     pin_map = override.get("pin_map")
     if not isinstance(pin_map, dict) or set(map(str, pin_map)) != source_pins:
         raise ValueError("explicit symbol-map pin map must contain every source pin exactly once")

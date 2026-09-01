@@ -18,8 +18,9 @@ SKILL_SCRIPTS = REPO / "skills" / "circuit-design-ngspice" / "scripts"
 sys.path.insert(0, str(SKILL_SCRIPTS))
 
 import circuit_project as cp  # noqa: E402
-from eda_export import SYMBOL_MAP_SCHEMA, _component_bounds, _stable_uuid, export_eda  # noqa: E402
+from eda_export import SYMBOL_MAP_SCHEMA, _component_bounds, _kicad_page_lines, _stable_uuid, export_eda  # noqa: E402
 from eda_kicad_validate import validate_kicad_package  # noqa: E402
+from eda_kicad_import import parse_kicad_schematic  # noqa: E402
 from eda_symbols import resolve_symbol_map  # noqa: E402
 from kicad_library import get_symbol, load_index, resolve_lib_root  # noqa: E402
 
@@ -28,6 +29,7 @@ AMS1117 = "Regulator_Linear:AMS1117-3.3"
 DEVICE_R = "Device:R"
 DEVICE_C = "Device:C"
 DEVICE_LED = "Device:LED"
+MULTI_UNIT_DIODE = "Device:D_Dual_CommonAnode_AKK_Split"
 
 
 def pin_nets_for(symbol: dict, net_for_name) -> dict[str, str]:
@@ -76,10 +78,53 @@ def main() -> int:
     assert ams1117 and len(ams1117["pins"]) == 3, "AMS1117-3.3 missing from index"
     assert device_r and len(device_r["pins"]) == 2, "Device:R missing from index"
 
+    multi_unit = get_symbol(index, MULTI_UNIT_DIODE)
+    assert multi_unit and multi_unit["unit_count"] == 2
+    multi_components = []
+    for unit_entry in multi_unit["units"]:
+        unit = unit_entry["unit"]
+        multi_components.append({
+            "id": f"xd1_{unit}",
+            "type": "BLOCK",
+            "name": "D1",
+            "value": "dual diode",
+            "position": {"x": 200 + unit * 100, "y": 200},
+            "rotation": 0,
+            "pins": [
+                {"id": pin["number"], "name": pin["name"], "net": f"n_{unit}_{pin['number']}"}
+                for pin in unit_entry["pins"]
+            ],
+            "block": {"width": 160, "height": 120},
+            "eda": {
+                "symbol": MULTI_UNIT_DIODE,
+                "unit": unit,
+                "package_id": "pkg_d1",
+                "refdes": "D1",
+            },
+        })
+    multi_page = {"id": "multi", "components": multi_components, "ports": [], "nets": [], "wires": []}
+    multi_map = resolve_symbol_map(None, [multi_page], ["kicad"], SYMBOL_MAP_SCHEMA)
+    multi_lines = "\n".join(_kicad_page_lines(
+        "multi-unit",
+        multi_page,
+        [{**component, "page_id": "multi"} for component in multi_components],
+        multi_map,
+        root_page=True,
+    ))
+    assert "(unit 1)" in multi_lines and "(unit 2)" in multi_lines, multi_lines
+    assert multi_lines.count('(property "Reference" "D1"') == 2, multi_lines
+
     # Keep temp writes on the repo drive (the system drive is space-tight).
     tmp_base = REPO / "output"
     tmp_base.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="place-library-component-", dir=tmp_base) as tmp:
+        multi_schematic = Path(tmp) / "multi.kicad_sch"
+        multi_schematic.write_text(multi_lines, encoding="utf-8")
+        imported_units = parse_kicad_schematic(multi_schematic)
+        assert {(item["refdes"], item["unit"], item["lib_id"]) for item in imported_units} == {
+            ("D1", 1, MULTI_UNIT_DIODE),
+            ("D1", 2, MULTI_UNIT_DIODE),
+        }
         root = cp.initialize_project(
             Path(tmp) / "projects", "place library regression", None, False,
             project_kind="pcb_schematic",
@@ -286,6 +331,23 @@ def main() -> int:
             "unknown library symbol: Device:NoSuchPart",
         )
 
+        # Multi-unit placement must declare a unit rather than collapsing all pins.
+        expect_apply_failure(
+            root,
+            command(project, revision, "place-library-multi-unit", [
+                {
+                    "op": "place_library_component",
+                    "module_id": "mcu_core",
+                    "name": "XD1",
+                    "value": "dual diode",
+                    "symbol": MULTI_UNIT_DIODE,
+                    "pin_nets": {"1": "common", "2": "left", "3": "right"},
+                },
+            ]),
+            "requires unit for multi-unit symbol",
+            MULTI_UNIT_DIODE,
+        )
+
         # Unknown module must fail clearly (failed applies stay transactional,
         # so the revision never advanced).
         expect_apply_failure(
@@ -304,6 +366,95 @@ def main() -> int:
         )
         project_now, _ = cp.load_project(root)
         assert project_now["revision"] == revision, "failed applies must not advance the revision"
+
+        # Separate project exercises unit/package placement without changing
+        # the readiness expectations of the main fixture.
+        multi_root = cp.initialize_project(
+            Path(tmp) / "multi-projects", "multi unit placement", None, False,
+            project_kind="pcb_schematic",
+        )
+        multi_project, _ = cp.load_project(multi_root)
+        seeded_multi = cp.apply_command(multi_root, command(
+            multi_project, multi_project["revision"], "seed-multi", [{
+                "op": "upsert_module_netlist",
+                "module_id": "multi",
+                "name": "multi",
+                "netlist_notebook": "* multi unit fixture\nR1 a 0 1k\n",
+            }],
+        ))
+        unit_pins = {entry["unit"]: entry["pins"] for entry in multi_unit["units"]}
+        first = cp.apply_command(multi_root, command(
+            multi_project, seeded_multi["revision"], "place-unit-1", [{
+                "op": "place_library_component",
+                "module_id": "multi",
+                "name": "D1",
+                "refdes": "D1",
+                "value": "dual diode",
+                "symbol": MULTI_UNIT_DIODE,
+                "footprint": "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+                "unit": 1,
+                "pin_nets": {pin["number"]: f"u1_{pin['number']}" for pin in unit_pins[1]},
+            }],
+        ))
+        _, multi_modules = cp.load_project(multi_root)
+        first_unit = next(component for component in multi_modules["multi"]["components"] if component["name"] == "D1")
+        package_id = first_unit["eda"]["package_id"]
+        second = cp.apply_command(multi_root, command(
+            multi_project, first["revision"], "place-unit-2", [{
+                "op": "place_library_component",
+                "module_id": "multi",
+                "name": "D1B",
+                "value": "dual diode",
+                "symbol": MULTI_UNIT_DIODE,
+                "footprint": "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+                "unit": 2,
+                "package_id": package_id,
+                "pin_nets": {pin["number"]: f"u2_{pin['number']}" for pin in unit_pins[2]},
+            }],
+        ))
+        _, multi_modules = cp.load_project(multi_root)
+        package_members = [
+            component for component in multi_modules["multi"]["components"]
+            if component.get("eda", {}).get("package_id") == package_id
+        ]
+        assert {component["eda"]["unit"] for component in package_members} == {1, 2}
+        assert {component["eda"]["refdes"] for component in package_members} == {"D1"}
+        multi_readiness = cp.pcb_export_readiness(multi_project, multi_modules)
+        package_member_ids = {component["id"] for component in package_members}
+        assert sum(
+            item["component_id"] in package_member_ids
+            for item in multi_readiness["missing_lcsc_id"]
+        ) == 1, multi_readiness
+        expect_apply_failure(
+            multi_root,
+            command(multi_project, second["revision"], "duplicate-unit-2", [{
+                "op": "place_library_component",
+                "module_id": "multi",
+                "name": "D1C",
+                "value": "dual diode",
+                "symbol": MULTI_UNIT_DIODE,
+                "footprint": "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+                "unit": 2,
+                "package_id": package_id,
+                "pin_nets": {pin["number"]: f"u2b_{pin['number']}" for pin in unit_pins[2]},
+            }]),
+            "already contains unit 2",
+        )
+        expect_apply_failure(
+            multi_root,
+            command(multi_project, second["revision"], "conflicting-package-value", [{
+                "op": "place_library_component",
+                "module_id": "multi",
+                "name": "D1",
+                "value": "different material",
+                "symbol": MULTI_UNIT_DIODE,
+                "footprint": "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+                "unit": 1,
+                "package_id": package_id,
+                "pin_nets": {pin["number"]: f"u1_{pin['number']}" for pin in unit_pins[1]},
+            }]),
+            "conflicting value",
+        )
 
         # place_library_component is pcb_schematic-only.
         other_root = cp.initialize_project(
@@ -418,6 +569,52 @@ def main() -> int:
         assert bindings["passives:r2"].get("library_symbol") == DEVICE_R
         # The netlist-seeded R1 keeps the generated standard symbol.
         assert not bindings["passives:r1"].get("library_symbol"), bindings["passives:r1"]
+
+        mapping_path = Path(tmp) / "symbol-map-override.json"
+        mapping_path.write_text(json.dumps({
+            "schema": SYMBOL_MAP_SCHEMA,
+            "targets": {
+                "kicad": {
+                    "components": {
+                        "passives:r2": {
+                            "library": "CustomLib",
+                            "cell": "CustomR",
+                            "view": "symbol",
+                            "pin_map": {"a": "1", "b": "2"},
+                        },
+                    },
+                },
+            },
+        }), encoding="utf-8")
+        overridden = resolve_symbol_map(mapping_path, pages, ["kicad"], SYMBOL_MAP_SCHEMA)
+        overridden_r2 = overridden["targets"]["kicad"]["components"]["passives:r2"]
+        assert overridden_r2["library"] == "CustomLib" and overridden_r2["cell"] == "CustomR"
+        assert "library_symbol" not in overridden_r2, overridden_r2
+
+        original_library_loader = cp.kicad_library_index
+        try:
+            def broken_library_index():
+                raise RuntimeError("corrupt bundled library")
+
+            cp.kicad_library_index = broken_library_index
+            readiness = cp.pcb_export_readiness(
+                {"project_kind": "pcb_schematic"},
+                {"m": {"components": [{
+                    "id": "r1",
+                    "type": "R",
+                    "name": "R1",
+                    "eda": {
+                        "lcsc_id": "C25804",
+                        "refdes": "R1",
+                        "symbol": DEVICE_R,
+                        "footprint": "Resistor_SMD:R_0603_1608Metric",
+                    },
+                }]}},
+            )
+        finally:
+            cp.kicad_library_index = original_library_loader
+        assert readiness["ready"] is False, readiness
+        assert readiness["library_error"] == "corrupt bundled library", readiness
 
         result = export_eda(
             Path(tmp) / "export",

@@ -27,6 +27,7 @@ import {
   type SchematicDocumentOptions,
   type SerializableSchematicDocument,
 } from '../../schematic/schematicDocumentImpl';
+import { hydrateSymbolGeometry } from '../../schematic/symbolIr';
 
 export {
   serializeSchematicDocument,
@@ -101,6 +102,9 @@ function componentProjectionShape(component: CircuitModule['components'][number]
     pins: component.pins,
     block: component.block,
     module_ref: component.module_ref,
+    symbol: component.eda?.symbol,
+    unit: component.eda?.unit ?? 1,
+    symbolVariant: component.eda?.symbol_variant ?? 1,
   };
 }
 
@@ -179,7 +183,13 @@ function reuseProjectedDocument(
     bounds: clone(previous.bounds),
     viewBox: clone(previous.viewBox),
     labelPlacements: new Map(),
+    symbolDefinitions: previous.symbolDefinitions,
+    symbolInstances: [],
+    symbolDiagnostics: [],
   };
+  const symbolProjection = hydrateSymbolGeometry(module, document.symbolDefinitions);
+  document.symbolInstances = symbolProjection.instances;
+  document.symbolDiagnostics = symbolProjection.diagnostics;
   // Recompute rather than reuse: placements depend on label/port text, which is
   // not part of the geometry identity that allowed this reuse path.
   document.labelPlacements = resolveSchematicLabelPlacements(document);
@@ -214,6 +224,7 @@ export function projectSchematicDocumentIncremental(
     && previous.sourceModule.module_id === module.module_id
     && previous.document.moduleId === module.module_id
     && !autoLayoutWouldRun(module, options)
+    && sameValue(previous.document.symbolDefinitions, options.symbolDefinitions ?? {})
     && sameValue(moduleProjectionShape(previous.sourceModule), moduleProjectionShape(module)),
   );
   if (!canReuse || !previous) {

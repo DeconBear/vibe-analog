@@ -18,6 +18,7 @@ TOP_SYMBOL_RE = re.compile(
     re.MULTILINE,
 )
 UUID_RE = re.compile(r"\(uuid\s+([^\s()]+)\)")
+UNIT_RE = re.compile(r"\(unit\s+(\d+)\)")
 
 
 def _component_key(component: dict[str, Any]) -> str:
@@ -106,6 +107,7 @@ def parse_kicad_schematic(path: Path) -> list[dict[str, Any]]:
                     break
         block = text[start:end]
         properties = _parse_property_block(block)
+        unit_match = UNIT_RE.search(block)
         actoviq_id = properties.get("ACTOVIQ_ID", "").strip()
         stable_id = actoviq_id
         if not stable_id:
@@ -123,6 +125,7 @@ def parse_kicad_schematic(path: Path) -> list[dict[str, Any]]:
                 "y_mm": float(match.group(3)),
                 "rotation_kicad": int(match.group(4)) % 360,
                 "refdes": properties.get("Reference", "").strip(),
+                "unit": int(unit_match.group(1)) if unit_match else 1,
                 "value": properties.get("Value", "").strip(),
                 "source_file": str(path),
                 "has_actoviq_id": bool(actoviq_id),
@@ -259,8 +262,12 @@ def import_kicad_peer(
         if instance.get("value"):
             target["value"] = instance["value"]
         eda = dict(target.get("eda") or {})
+        eda["symbol"] = instance["lib_id"]
+        eda["unit"] = int(instance.get("unit") or 1)
         if instance.get("refdes"):
             eda["refdes"] = instance["refdes"]
+            package_identity = f"{page_id}|{instance['lib_id']}|{instance['refdes']}"
+            eda["package_id"] = f"pkg_kicad_{hashlib.sha256(package_identity.encode('utf-8')).hexdigest()[:16]}"
         target["eda"] = eda
         key = _component_key(component)
         id_map[key] = {

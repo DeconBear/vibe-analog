@@ -340,6 +340,10 @@ const electronAPI = {
     return ipcRenderer.invoke('project:get', projectId);
   },
 
+  resolveKicadSymbolIr(symbolIds: string[]): Promise<unknown> {
+    return ipcRenderer.invoke('library:resolve-kicad-symbol-ir', symbolIds);
+  },
+
   listHdlFiles(projectId: string): Promise<string[]> {
     return ipcRenderer.invoke('project:list-hdl-files', projectId);
   },

@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 import re
 
-from eda_kicad_validate import _children, _head, _parse_sexpr
+from eda_kicad_validate import _children, _head
+from kicad_library import flatten_symbol_node, parse_sexpr as _parse_sexpr
 
 
 def _library_search_paths(library: str) -> list[Path]:
@@ -40,6 +41,7 @@ def find_library_file(library: str) -> Path:
 
 _SYMBOL_CACHE: dict[Path, dict[str, list[Any]]] = {}
 _FLAT_CACHE: dict[tuple[Path, str], list[Any]] = {}
+_UNIT_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
 
 
 def _load_symbols(path: Path) -> dict[str, list[Any]]:
@@ -47,6 +49,8 @@ def _load_symbols(path: Path) -> dict[str, list[Any]]:
     if cached is not None:
         return cached
     parsed = _parse_sexpr(path.read_text(encoding="utf-8"))
+    if _head(parsed) != "kicad_symbol_lib":
+        parsed = next((node for node in parsed if _head(node) == "kicad_symbol_lib"), parsed)
     if _head(parsed) != "kicad_symbol_lib":
         raise ValueError(f"invalid KiCad symbol library root: {path}")
     symbols: dict[str, list[Any]] = {}
@@ -60,45 +64,7 @@ def _load_symbols(path: Path) -> dict[str, list[Any]]:
 
 def _flatten_symbol(symbols: dict[str, list[Any]], cell: str, stack: tuple[str, ...] = ()) -> list[Any]:
     """Return a deep copy of ``cell`` with ``extends`` inheritance resolved."""
-
-    if cell in stack:
-        raise ValueError(f"cyclic KiCad symbol inheritance: {' -> '.join((*stack, cell))}")
-    node = symbols.get(cell)
-    if node is None:
-        raise ValueError(f"KiCad symbol {cell!r} not found in bundled library")
-    result = deepcopy(node)
-    extends = _children(result, "extends")
-    if not extends:
-        return result
-    if len(extends) != 1 or len(extends[0]) < 2 or isinstance(extends[0][1], list):
-        raise ValueError(f"KiCad symbol {cell!r} has a malformed extends clause")
-    parent_name = str(extends[0][1])
-    parent = _flatten_symbol(symbols, parent_name, (*stack, cell))
-    result = [child for child in result if _head(child) != "extends"]
-    present_heads = {_head(child) for child in result[2:] if isinstance(child, list)}
-    present_properties = {
-        str(child[1])
-        for child in _children(result, "property")
-        if len(child) >= 2 and not isinstance(child[1], list)
-    }
-    for child in parent[2:]:
-        if not isinstance(child, list):
-            continue
-        head = _head(child)
-        if head == "symbol":
-            subunit = deepcopy(child)
-            subunit_name = str(subunit[1])
-            if not subunit_name.startswith(parent_name):
-                raise ValueError(f"KiCad symbol {parent_name!r} has an unexpected subunit {subunit_name!r}")
-            subunit[1] = cell + subunit_name[len(parent_name):]
-            result.append(subunit)
-        elif head == "property":
-            if len(child) >= 2 and not isinstance(child[1], list) and str(child[1]) not in present_properties:
-                result.append(deepcopy(child))
-        elif head and head not in present_heads:
-            result.append(deepcopy(child))
-            present_heads.add(head)
-    return result
+    return flatten_symbol_node(symbols, cell, stack)
 
 
 def _rename_definition(node: list[Any], cell: str, name: str) -> list[Any]:
@@ -185,6 +151,21 @@ def symbol_footprint(library: str, cell: str) -> str:
     return ""
 
 
+def symbol_unit_count(library: str, cell: str) -> int:
+    """Return the number of independently placeable units in a symbol."""
+
+    flattened = _flattened_symbol(library, cell)
+    units = {
+        int(match.group(1))
+        for subunit in _children(flattened, "symbol")
+        if len(subunit) > 1
+        and not isinstance(subunit[1], list)
+        and (match := _UNIT_SUFFIX_RE.search(str(subunit[1])))
+        and int(match.group(1)) > 0
+    }
+    return len(units) or 1
+
+
 def _footprint_search_paths(footprint_id: str) -> list[Path]:
     library, _, name = footprint_id.partition(":")
     relative = Path("footprints") / f"{library}.pretty" / f"{name}.kicad_mod"
@@ -216,6 +197,8 @@ def footprint_pad_numbers(path: Path) -> set[str]:
 
     parsed = _parse_sexpr(path.read_text(encoding="utf-8"))
     if _head(parsed) != "footprint":
+        parsed = next((node for node in parsed if _head(node) == "footprint"), parsed)
+    if _head(parsed) != "footprint":
         raise ValueError(f"invalid KiCad footprint root: {path}")
     return {
         str(pad[1])
@@ -224,7 +207,7 @@ def footprint_pad_numbers(path: Path) -> set[str]:
     }
 
 
-def symbol_pin_positions(library: str, cell: str) -> dict[str, tuple[float, float, float]]:
+def symbol_pin_positions(library: str, cell: str, *, unit: int = 1) -> dict[str, tuple[float, float, float]]:
     """Return ``{pin number: (x_mm, y_mm, angle_deg)}`` for a bundled symbol.
 
     Instances of a real library symbol expose their pins at the symbol's own
@@ -240,6 +223,10 @@ def symbol_pin_positions(library: str, cell: str) -> dict[str, tuple[float, floa
         _FLAT_CACHE[key] = flattened
     pins: dict[str, tuple[float, float, float]] = {}
     for subunit in _children(flattened, "symbol"):
+        subunit_name = str(subunit[1]) if len(subunit) > 1 and not isinstance(subunit[1], list) else ""
+        match = _UNIT_SUFFIX_RE.search(subunit_name)
+        if match is not None and int(match.group(1)) not in {0, unit}:
+            continue
         for entry in subunit[2:]:
             if not isinstance(entry, list) or _head(entry) != "pin":
                 continue

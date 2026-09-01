@@ -12,6 +12,15 @@ import {
   defaultParametersForType,
   projectComponentValue,
 } from '../components/canvas/componentParams/projectToValue';
+import {
+  hydrateSymbolGeometry,
+  resolveSymbolDefinition,
+  resolveSymbolVariant,
+  rotateSymbolPoint,
+  type SymbolIrDefinition,
+  type SymbolIrDiagnostic,
+  type SymbolIrInstance,
+} from './symbolIr';
 
 export const SCHEMATIC_GRID = 20;
 export const PIN_REACH = 12;
@@ -143,10 +152,14 @@ export interface SchematicDocument {
    * anchor. See resolveSchematicLabelPlacements.
    */
   labelPlacements: Map<string, SchematicTextPlacement>;
+  symbolDefinitions: Record<string, SymbolIrDefinition>;
+  symbolInstances: SymbolIrInstance[];
+  symbolDiagnostics: SymbolIrDiagnostic[];
 }
 
 export interface SchematicDocumentOptions {
   autoLayout?: boolean;
+  symbolDefinitions?: Record<string, SymbolIrDefinition>;
 }
 
 /**
@@ -170,6 +183,9 @@ export interface SerializableSchematicDocument {
   bounds: SchematicBounds;
   viewBox: SchematicBounds;
   labelPlacements: Record<string, SchematicTextPlacement>;
+  symbolDefinitions?: Record<string, SymbolIrDefinition>;
+  symbolInstances?: SymbolIrInstance[];
+  symbolDiagnostics?: SymbolIrDiagnostic[];
 }
 
 export function serializeSchematicDocument(document: SchematicDocument): SerializableSchematicDocument {
@@ -193,18 +209,26 @@ export function serializeSchematicDocument(document: SchematicDocument): Seriali
     bounds: document.bounds,
     viewBox: document.viewBox,
     labelPlacements,
+    symbolDefinitions: document.symbolDefinitions,
+    symbolInstances: document.symbolInstances,
+    symbolDiagnostics: document.symbolDiagnostics,
   };
 }
 
 export function deserializeSchematicDocument(
   document: SerializableSchematicDocument,
 ): SchematicDocument {
-  return {
+  const result: SchematicDocument = {
     ...document,
     portPositions: new Map(Object.entries(document.portPositions)),
     connectedPortIds: new Set(document.connectedPortIds),
     labelPlacements: new Map(Object.entries(document.labelPlacements ?? {})),
+    symbolDefinitions: document.symbolDefinitions ?? {},
+    symbolInstances: document.symbolInstances ?? [],
+    symbolDiagnostics: document.symbolDiagnostics ?? [],
   };
+  hydrateSymbolGeometry(result.module, result.symbolDefinitions);
+  return result;
 }
 
 export interface WireTopologyIssue {
@@ -258,7 +282,11 @@ export function createSchematicDocumentImplementation(
     && (module.wires ?? []).length === 0
     && module.components.length <= AUTO_LAYOUT_COMPONENT_LIMIT
   );
-  const next = shouldAutoLayout ? autoLayoutModule(cloneModule(module)) : cloneModule(module);
+  let next = cloneModule(module);
+  const symbolDefinitions = options.symbolDefinitions ?? {};
+  hydrateSymbolGeometry(next, symbolDefinitions);
+  if (shouldAutoLayout) next = autoLayoutModule(next);
+  const symbolProjection = hydrateSymbolGeometry(next, symbolDefinitions);
   next.ports = normalizeSchematicPorts(next.ports, next.components, next.wires);
   ensureStableNetModel(next);
   for (const component of next.components) {
@@ -290,6 +318,9 @@ export function createSchematicDocumentImplementation(
     bounds,
     viewBox,
     labelPlacements: new Map(),
+    symbolDefinitions,
+    symbolInstances: symbolProjection.instances,
+    symbolDiagnostics: symbolProjection.diagnostics,
   };
   document.labelPlacements = resolveSchematicLabelPlacements(document);
   return document;
@@ -571,6 +602,12 @@ export function makePlacedModuleInstance(
 
 export function isBlockLike(component: CircuitComponent): boolean {
   return component.type === 'BLOCK' || component.type === 'MODULE';
+}
+
+/** Library-backed crystal families use a compact native glyph in the editor. */
+export function isCrystalComponent(component: CircuitComponent): boolean {
+  const symbol = String(component.eda?.symbol ?? '');
+  return component.type === 'BLOCK' && /^Device:(?:Crystal|Resonator)(?:_|$)/i.test(symbol);
 }
 
 function autoLayoutModule(module: CircuitModule): CircuitModule {
@@ -2981,7 +3018,10 @@ function isGroundNet(net: string, module: CircuitModule): boolean {
 }
 
 export function pinWorld(component: CircuitComponent, pin: CircuitPin, index: number): CircuitPosition {
-  const offset = pinOffset(component, pin, index);
+  const symbolPin = resolveSymbolVariant(component)?.pins.find((entry) => entry.number === pin.id);
+  const offset = symbolPin
+    ? rotateSymbolPoint(symbolPin.at, normalizeRotation(component.rotation))
+    : pinOffset(component, pin, index);
   return {
     x: component.position.x + offset.x,
     y: component.position.y + offset.y,
@@ -3051,9 +3091,47 @@ export function blockPinBodyWorld(component: CircuitComponent, pin: CircuitPin, 
   return { x: component.position.x + offset.x, y: component.position.y + offset.y };
 }
 
+function crystalPinLocalOffsets(
+  component: CircuitComponent,
+  pin: CircuitPin,
+  index: number,
+): { endpoint: CircuitPosition; body: CircuitPosition } {
+  const side = blockPinSide(component, pin, index);
+  if (side === 'left') return { endpoint: { x: -52, y: 0 }, body: { x: -12, y: 0 } };
+  if (side === 'right') return { endpoint: { x: 52, y: 0 }, body: { x: 12, y: 0 } };
+  if (side === 'top') return { endpoint: { x: 0, y: -52 }, body: { x: 0, y: -30 } };
+  return { endpoint: { x: 0, y: 52 }, body: { x: 0, y: 30 } };
+}
+
+export function crystalPinBodyWorld(component: CircuitComponent, pin: CircuitPin, index: number): CircuitPosition {
+  const offset = rotateOffset(crystalPinLocalOffsets(component, pin, index).body, normalizeRotation(component.rotation));
+  return { x: component.position.x + offset.x, y: component.position.y + offset.y };
+}
+
 export function componentBounds(component: CircuitComponent): SchematicBounds {
   const pins = component.pins.map((pin, index) => pinWorld(component, pin, index));
-  const bodyPoints = (component.type === 'BLOCK' || component.type === 'MODULE')
+  const symbolBounds = resolveSymbolVariant(component)?.bounds;
+  const bodyPoints = symbolBounds
+    ? [
+        { x: symbolBounds.minX, y: symbolBounds.minY },
+        { x: symbolBounds.maxX, y: symbolBounds.minY },
+        { x: symbolBounds.maxX, y: symbolBounds.maxY },
+        { x: symbolBounds.minX, y: symbolBounds.maxY },
+      ].map((point) => {
+        const offset = rotateSymbolPoint(point, normalizeRotation(component.rotation));
+        return { x: component.position.x + offset.x, y: component.position.y + offset.y };
+      })
+    : isCrystalComponent(component)
+    ? [
+        { x: -26, y: -32 },
+        { x: 26, y: -32 },
+        { x: 26, y: 32 },
+        { x: -26, y: 32 },
+      ].map((point) => {
+        const offset = rotateOffset(point, normalizeRotation(component.rotation));
+        return { x: component.position.x + offset.x, y: component.position.y + offset.y };
+      })
+    : (component.type === 'BLOCK' || component.type === 'MODULE')
     ? (() => {
         const { width, height } = blockBodySize(component);
         return [
@@ -3526,6 +3604,26 @@ export function componentLabelPositions(component: CircuitComponent): {
 } {
   const { x, y } = component.position;
   const rotation = ((component.rotation ?? 0) % 360 + 360) % 360;
+  const symbolDefinition = resolveSymbolDefinition(component);
+  if (symbolDefinition && resolveSymbolVariant(component)) {
+    const placement = (property: 'reference' | 'value'): SchematicTextPlacement => {
+      const definition = symbolDefinition.properties[property];
+      const offset = rotateSymbolPoint(definition.at, rotation);
+      const justify = definition.effects.justify;
+      return {
+        x: x + offset.x,
+        y: y + offset.y,
+        anchor: justify.includes('left') ? 'start' : justify.includes('right') ? 'end' : 'middle',
+      };
+    };
+    return { name: placement('reference'), value: placement('value') };
+  }
+  if (isCrystalComponent(component)) {
+    return {
+      name: { x, y: y - 44, anchor: 'middle' },
+      value: { x, y: y + 48, anchor: 'middle' },
+    };
+  }
   const isVerticalTwoPin = component.pins.length === 2 && (rotation === 90 || rotation === 270);
   // Gate-drive V/I sources sit left of MOSFET gates. Keep their text on the upper-left so
   // long PULSE(...) strings do not collide with the local GND stub under the negative pin.
@@ -3572,6 +3670,12 @@ export function componentLabelPositions(component: CircuitComponent): {
     name: { x, y: y - 42, anchor: 'middle' },
     value: { x, y: y + 44, anchor: 'middle' },
   };
+}
+
+export function displayComponentReference(component: CircuitComponent): string {
+  return resolveSymbolVariant(component) && typeof component.eda?.refdes === 'string' && component.eda.refdes.trim()
+    ? component.eda.refdes.trim()
+    : component.name;
 }
 
 /** Compact long SPICE sources so canvas labels stay readable without changing stored values. */
@@ -3648,12 +3752,12 @@ export function collectSchematicTextItems(document: SchematicDocument): Schemati
       apply({
         key: `component:${component.id}:name`,
         kind: 'component-name',
-        text: component.name,
+        text: displayComponentReference(component),
         fontSize: COMPONENT_NAME_FONT_SIZE,
         defaultPlacement: labels.name,
       });
     }
-    if (component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND') {
+    if ((component.type !== 'BLOCK' && component.type !== 'MODULE' && component.type !== 'GND') || isCrystalComponent(component)) {
       const value = displayComponentValue(component.value);
       if (value) {
         apply({
@@ -5132,6 +5236,14 @@ function pointHitsComponentGraphic(component: CircuitComponent, world: CircuitPo
   if (component.type === 'E') return pointNearOpampGraphic(component, world);
 
   const local = componentLocalPoint(component, world);
+  const symbolBounds = resolveSymbolVariant(component)?.bounds;
+  if (symbolBounds) {
+    return local.x >= symbolBounds.minX && local.x <= symbolBounds.maxX
+      && local.y >= symbolBounds.minY && local.y <= symbolBounds.maxY;
+  }
+  if (isCrystalComponent(component)) {
+    return Math.abs(local.x) <= 28 && Math.abs(local.y) <= 34;
+  }
   if ((component.type === 'BLOCK' || component.type === 'MODULE')) {
     const { width, height } = blockBodySize(component);
     return Math.abs(local.x) <= width / 2 && Math.abs(local.y) <= height / 2;
@@ -5244,7 +5356,9 @@ export function wireIdToken(value: string): string {
 function pinOffset(component: CircuitComponent, pin: CircuitPin, index: number): CircuitPosition {
   const key = `${pin.id} ${pin.name}`.toLowerCase();
   let offset: CircuitPosition;
-  if ((component.type === 'BLOCK' || component.type === 'MODULE')) {
+  if (isCrystalComponent(component)) {
+    offset = crystalPinLocalOffsets(component, pin, index).endpoint;
+  } else if ((component.type === 'BLOCK' || component.type === 'MODULE')) {
     offset = blockPinLocalOffsets(component, pin, index).endpoint;
   } else if (component.type === 'M') {
     const pmos = isPmosComponent(component);

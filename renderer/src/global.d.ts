@@ -45,6 +45,7 @@ import type {
   XschemSyncResult,
 } from './types';
 import type { SerializableSchematicDocument } from './schematic/schematicDocument';
+import type { SymbolIrBundle } from './schematic/symbolIr';
 
 export {};
 
@@ -120,6 +121,7 @@ declare global {
       createCircuitProject(input: { name: string; demo?: boolean; projectKind?: ProjectKind }): Promise<CircuitProjectBundle>;
       createCircuitProjectFromTemplate(input: { templateId: string; name?: string }): Promise<CircuitProjectBundle>;
       getCircuitProject(projectId: string): Promise<CircuitProjectBundle>;
+      resolveKicadSymbolIr(symbolIds: string[]): Promise<SymbolIrBundle>;
       listHdlFiles(projectId: string): Promise<string[]>;
       readHdlFile(projectId: string, relativePath: string): Promise<string>;
       writeHdlFile(

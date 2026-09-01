@@ -26,6 +26,10 @@ export function PcbParamForm({
   inputStyle,
   hintStyle,
   onPatch,
+  symbolDefinition,
+  packageOptions = [],
+  onUnitChange,
+  onPackageChange,
 }: ComponentParamFormProps) {
   const eda = component.eda || {};
   const patchEda = (key: string, value: string) => {
@@ -38,6 +42,38 @@ export function PcbParamForm({
 
   return (
     <>
+      {eda.symbol ? (
+        <>
+          <Field label="KiCad symbol" style={fieldLabelStyle}>
+            <input style={inputStyle} value={String(eda.symbol)} readOnly data-testid="schematic-param-symbol" />
+          </Field>
+          <Field label="Symbol unit" style={fieldLabelStyle}>
+            <select
+              style={inputStyle}
+              value={String(eda.unit ?? 1)}
+              disabled={busy || !symbolDefinition || symbolDefinition.unit_count <= 1}
+              onChange={(event) => onUnitChange?.(Number(event.target.value))}
+              data-testid="schematic-param-symbol-unit"
+            >
+              {Array.from({ length: symbolDefinition?.unit_count ?? 1 }, (_, index) => index + 1).map((unit) => (
+                <option key={unit} value={unit}>{unit}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Physical package" style={fieldLabelStyle}>
+            <select
+              style={inputStyle}
+              value={String(eda.package_id ?? '')}
+              disabled={busy || packageOptions.length === 0}
+              onChange={(event) => onPackageChange?.(event.target.value)}
+              data-testid="schematic-param-package"
+            >
+              {!eda.package_id ? <option value="">Not grouped</option> : null}
+              {packageOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+            </select>
+          </Field>
+        </>
+      ) : null}
       <Field label="Value (BOM display)" style={fieldLabelStyle}>
         <input
           style={inputStyle}
@@ -67,6 +103,16 @@ export function PcbParamForm({
           placeholder="e.g. R_0603"
           data-testid="schematic-param-footprint"
           onChange={(event) => patchEda('footprint_hint', event.target.value)}
+        />
+      </Field>
+      <Field label="KiCad footprint" style={fieldLabelStyle}>
+        <input
+          style={inputStyle}
+          value={String(eda.footprint ?? '')}
+          disabled={busy}
+          placeholder="Library:Footprint"
+          data-testid="schematic-param-kicad-footprint"
+          onChange={(event) => patchEda('footprint', event.target.value)}
         />
       </Field>
       <Field label="LCSC ID" style={fieldLabelStyle}>

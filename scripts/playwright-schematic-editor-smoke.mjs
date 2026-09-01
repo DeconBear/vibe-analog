@@ -152,6 +152,9 @@ try {
     await page.getByTestId('circuit-workbench').getByText(projectName, { exact: true }).waitFor();
     await page.getByTestId('module-preview-filter').waitFor({ timeout: 20_000 });
     console.log('[e2e] project selected');
+    await page.waitForFunction(() => (
+      document.querySelector('[data-testid="module-preview-filter"]')?.getAttribute('data-schematic-source') === 'document'
+    ));
     assert.equal(await page.getByTestId('module-preview-filter').getAttribute('data-schematic-source'), 'document');
     assert.ok(
       await page.getByTestId('module-preview-document-svg-filter').locator('g[data-wire-id]').count() >= 3,
@@ -4285,6 +4288,58 @@ try {
     );
     await page.screenshot({ path: path.resolve(outputRoot, 'schematic-editor-gnd.png') });
     console.log('[e2e] GND placeable/selectable/deletable with no SPICE card verified');
+  }
+
+  if (shouldRun("crystal")) {
+    await page.getByTestId(`sidebar-project-${pcbParamProject.projectId}`).click();
+    await waitForWorkbenchProject(page, pcbParamProject.projectId);
+    await page.getByTestId('circuit-workbench').getByText(pcbParamProject.projectName, { exact: true }).waitFor();
+    if (await page.getByTestId('back-to-board').count()) {
+      await page.getByTestId('back-to-board').click();
+    }
+    await openModuleCard(page, pcbParamProject.moduleId);
+    await page.getByTestId('schematic-editor').waitFor({ timeout: 20_000 });
+    const resolvedIr = await page.evaluate((symbolIds) => window.electronAPI.resolveKicadSymbolIr(symbolIds), [
+      'Switch:SW_Push',
+      'Connector:Conn_01x04_Pin',
+      'MCU_ST_STM32F1:STM32F103C8Tx',
+      'Device:D_Dual_CommonAnode_AKK_Split',
+    ]);
+    assert.deepEqual(Object.keys(resolvedIr.definitions).sort(), [
+      'Connector:Conn_01x04_Pin',
+      'Device:D_Dual_CommonAnode_AKK_Split',
+      'MCU_ST_STM32F1:STM32F103C8Tx',
+      'Switch:SW_Push',
+    ]);
+    const crystal = page.locator('g[data-component-id="y1"]');
+    await crystal.locator('[data-symbol-kind="crystal"]').waitFor();
+    assert.equal(await crystal.locator('[data-symbol-kind="block"]').count(), 0, 'crystal must not render as a generic block');
+    await crystal.getByTestId('schematic-component-name-label').filter({ hasText: 'Y1' }).waitFor();
+    await crystal.getByTestId('schematic-component-value-label').filter({ hasText: '8 MHz' }).waitFor();
+    for (const componentId of ['sw1', 'j1', 'u1', 'd1a', 'd1b', 'd2a']) {
+      const generic = page.locator(`g[data-component-id="${componentId}"]`);
+      await generic.locator('[data-symbol-kind="kicad-ir"]').waitFor({ timeout: 20_000 });
+      assert.equal(await generic.locator('[data-symbol-kind="block"]').count(), 0, `${componentId} must use KiCad Symbol IR`);
+    }
+    assert.equal(await page.locator('g[data-component-id="d1a"] [data-symbol-unit="1"]').count(), 1);
+    assert.equal(await page.locator('g[data-component-id="d1b"] [data-symbol-unit="2"]').count(), 1);
+    await selectComponentForDrag(page, 'd2a');
+    await page.getByTestId('schematic-param-symbol').waitFor();
+    assert.equal(await page.getByTestId('schematic-param-symbol').inputValue(), 'Device:D_Dual_CommonAnode_AKK_Split');
+    assert.equal(await page.getByTestId('schematic-param-package').inputValue(), 'pkg_d2');
+    await page.getByTestId('schematic-param-symbol-unit').selectOption('2');
+    await page.locator('g[data-component-id="d2a"] [data-symbol-unit="2"]').waitFor();
+    const switchedComponents = JSON.parse(await page.getByTestId('schematic-editor').getAttribute('data-components'));
+    const switched = switchedComponents.find((component) => component.id === 'd2a');
+    assert.deepEqual(switched.pins.map((pin) => pin.id), ['1', '3']);
+    assert.ok(switched.pins.every((pin) => pin.no_connect && pin.net.startsWith('nc_d2a_')));
+    await page.getByTestId('schematic-editor-save').click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="schematic-editor"]')?.getAttribute('data-dirty') === 'false');
+    await page.getByTestId('back-to-board').click();
+    await openModuleCard(page, pcbParamProject.moduleId);
+    await page.locator('g[data-component-id="d2a"] [data-symbol-unit="2"]').waitFor({ timeout: 20_000 });
+    await page.screenshot({ path: path.resolve(outputRoot, 'schematic-editor-crystal.png') });
+    console.log('[e2e] native crystal and generic KiCad Symbol IR devices render');
   }
 
   if (shouldRun("params")) {

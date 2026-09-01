@@ -143,7 +143,54 @@ export async function createHarness({ tag = '' } = {}) {
         { id: 'in', name: 'IN', direction: 'input', signal_type: 'analog', net: 'in' },
         { id: 'gnd', name: 'GND', direction: 'bidirectional', signal_type: 'ground', net: '0' },
       ],
-      components: [],
+      components: [{
+        id: 'y1',
+        type: 'BLOCK',
+        name: 'Y1',
+        value: '8 MHz',
+        position: { x: 720, y: 360 },
+        rotation: 0,
+        pins: [
+          { id: '1', name: '1', net: 'xin', side: 'left', order: 0 },
+          { id: '2', name: '2', net: 'xout', side: 'right', order: 0 },
+        ],
+        block: { width: 160, height: 120 },
+        eda: {
+          symbol: 'Device:Crystal',
+          footprint: 'Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm',
+          refdes: 'Y1',
+        },
+      }, {
+        id: 'sw1', type: 'BLOCK', name: 'SW1', value: 'SW_Push',
+        position: { x: 940, y: 220 }, rotation: 0,
+        pins: ['1', '2'].map((id) => ({ id, name: id, net: `nc_sw1_${id}`, no_connect: true })),
+        eda: { symbol: 'Switch:SW_Push', unit: 1, symbol_variant: 1, package_id: 'pkg_sw1', refdes: 'SW1' },
+      }, {
+        id: 'j1', type: 'BLOCK', name: 'J1', value: 'Conn_01x04_Pin',
+        position: { x: 940, y: 420 }, rotation: 90,
+        pins: ['1', '2', '3', '4'].map((id) => ({ id, name: id, net: `nc_j1_${id}`, no_connect: true })),
+        eda: { symbol: 'Connector:Conn_01x04_Pin', unit: 1, symbol_variant: 1, package_id: 'pkg_j1', refdes: 'J1' },
+      }, {
+        id: 'u1', type: 'BLOCK', name: 'U1', value: 'STM32F103C8Tx',
+        position: { x: 1240, y: 420 }, rotation: 0,
+        pins: Array.from({ length: 48 }, (_, index) => ({ id: String(index + 1), name: String(index + 1), net: `nc_u1_${index + 1}`, no_connect: true })),
+        eda: { symbol: 'MCU_ST_STM32F1:STM32F103C8Tx', unit: 1, symbol_variant: 1, package_id: 'pkg_u1', refdes: 'U1' },
+      }, {
+        id: 'd1a', type: 'BLOCK', name: 'D1', value: 'Dual diode',
+        position: { x: 760, y: 600 }, rotation: 0,
+        pins: ['1', '2'].map((id) => ({ id, name: id, net: `nc_d1a_${id}`, no_connect: true })),
+        eda: { symbol: 'Device:D_Dual_CommonAnode_AKK_Split', unit: 1, symbol_variant: 1, package_id: 'pkg_d1', refdes: 'D1' },
+      }, {
+        id: 'd1b', type: 'BLOCK', name: 'D1', value: 'Dual diode',
+        position: { x: 940, y: 600 }, rotation: 180,
+        pins: ['1', '3'].map((id) => ({ id, name: id, net: `nc_d1b_${id}`, no_connect: true })),
+        eda: { symbol: 'Device:D_Dual_CommonAnode_AKK_Split', unit: 2, symbol_variant: 1, package_id: 'pkg_d1', refdes: 'D1' },
+      }, {
+        id: 'd2a', type: 'BLOCK', name: 'D2', value: 'Dual diode',
+        position: { x: 1120, y: 600 }, rotation: 0,
+        pins: ['1', '2'].map((id) => ({ id, name: id, net: `nc_d2a_${id}`, no_connect: true })),
+        eda: { symbol: 'Device:D_Dual_CommonAnode_AKK_Split', unit: 1, symbol_variant: 1, package_id: 'pkg_d2', refdes: 'D2' },
+      }],
       wires: [],
       annotations: [],
     };

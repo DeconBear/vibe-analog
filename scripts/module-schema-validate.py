@@ -53,7 +53,24 @@ def main() -> None:
     invalid["components"][0]["pins"][0]["no_connect"] = "yes"
     assert list(VALIDATOR.iter_errors(invalid))
     print("PASS non-boolean pin no_connect rejected")
-    print(json.dumps({"ok": True, "passed": 2, "failed": 0, "total": 2}, indent=2))
+
+    symbol_instance = copy.deepcopy(BASE_MODULE)
+    symbol_instance["components"][0]["eda"] = {
+        "symbol": "Device:D_Dual_CommonAnode_AKK_Split",
+        "footprint": "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+        "unit": 2,
+        "symbol_variant": 1,
+        "package_id": "pkg_d1",
+    }
+    assert not list(VALIDATOR.iter_errors(symbol_instance))
+    print("PASS symbol unit/package metadata")
+
+    for field, value in (("unit", 0), ("symbol_variant", 0), ("package_id", "")):
+        invalid = copy.deepcopy(symbol_instance)
+        invalid["components"][0]["eda"][field] = value
+        assert list(VALIDATOR.iter_errors(invalid)), (field, value)
+        print(f"PASS invalid {field} rejected")
+    print(json.dumps({"ok": True, "passed": 6, "failed": 0, "total": 6}, indent=2))
 
 
 if __name__ == "__main__":

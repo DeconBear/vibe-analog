@@ -21,9 +21,10 @@ export { PdkDeviceBrowser } from './PdkDeviceBrowser';
 
 export function ComponentParamForm(props: ComponentParamFormProps) {
   const { projectKind, component } = props;
-  if (component.type === 'GND' || component.type === 'BLOCK' || component.type === 'MODULE') {
+  if (component.type === 'GND' || component.type === 'MODULE') {
     return null;
   }
+  if (component.type === 'BLOCK' && !(projectKind === 'pcb_schematic' && component.eda?.symbol)) return null;
   if (projectKind === 'pcb_schematic') {
     return <PcbParamForm {...props} />;
   }

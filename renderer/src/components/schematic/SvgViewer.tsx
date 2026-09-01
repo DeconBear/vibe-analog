@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAppStore } from '../../store/appStore';
 import { SchematicDocumentSvg } from '../../schematic/SchematicDocumentSvg';
 import { projectSchematicDocument as createSchematicDocument } from '../../schematic-core/projection/facade';
+import { useKicadSymbolDefinitions } from '../../schematic/useKicadSymbolDefinitions';
 
 export function SvgViewer() {
   const workflowSvg = useAppStore((s) => s.svgContent);
@@ -12,9 +13,10 @@ export function SvgViewer() {
   const moduleData = moduleId ? bundle?.modules[moduleId] : undefined;
   const modulePreview = moduleId ? bundle?.module_previews[moduleId] : undefined;
   const projectContext = Boolean(projectId && moduleId && bundle);
+  const symbolDefinitions = useKicadSymbolDefinitions(moduleData);
   const schematicDocument = useMemo(
-    () => projectContext && moduleData ? createSchematicDocument(moduleData) : null,
-    [moduleData, projectContext],
+    () => projectContext && moduleData ? createSchematicDocument(moduleData, { symbolDefinitions }) : null,
+    [moduleData, projectContext, symbolDefinitions],
   );
   const svgContent = schematicDocument ? '' : projectContext ? modulePreview?.svg ?? '' : workflowSvg;
   const svgDimensions = useMemo(() => {

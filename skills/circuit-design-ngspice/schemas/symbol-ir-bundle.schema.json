@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actoviq.local/schemas/symbol-ir-bundle.schema.json",
+  "title": "Actoviq Symbol IR Bundle",
+  "type": "object",
+  "required": ["schema", "definitions", "diagnostics"],
+  "properties": {
+    "schema": { "const": "actoviq.symbol-ir-bundle.v1" },
+    "ok": { "type": "boolean" },
+    "definitions": {
+      "type": "object",
+      "additionalProperties": { "$ref": "symbol-ir.schema.json" }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "symbol_id": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -35,6 +35,7 @@ import {
 } from './SchematicEditor';
 import { WorkbenchToolbar } from './WorkbenchToolbar';
 import { SchematicDocumentSvg } from '../../schematic/SchematicDocumentSvg';
+import { useKicadSymbolDefinitions } from '../../schematic/useKicadSymbolDefinitions';
 import {
   projectSchematicArtifact,
   projectSchematicDocument as createSchematicDocument,
@@ -3449,9 +3450,10 @@ function ModuleSchematic({
     return { mapped, unmapped: overrideItems.length - mapped };
   }, [module.id, moduleData, overrideItems]);
   const selectedOverride = selectedItem ? overrides?.items[selectedItem] : undefined;
+  const symbolDefinitions = useKicadSymbolDefinitions(moduleData);
   const schematicDocument = useMemo(
-    () => moduleData ? createSchematicDocument(moduleData) : null,
-    [moduleData],
+    () => moduleData ? createSchematicDocument(moduleData, { symbolDefinitions }) : null,
+    [moduleData, symbolDefinitions],
   );
 
   useEffect(() => {

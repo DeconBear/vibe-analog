@@ -57,6 +57,20 @@ export function deriveLiveErc(document: SchematicDocument): LiveErcDiagnostic[] 
       pin_id: diagnostic.entity_ids?.[1],
     }),
   );
+  for (const diagnostic of document.symbolDiagnostics ?? []) {
+    const component = diagnostic.component_id
+      ? document.module.components.find((entry) => entry.id === diagnostic.component_id)
+      : undefined;
+    diagnostics.push({
+      id: diagnosticId(diagnostic.code, diagnostic.component_id ?? diagnostic.symbol_id ?? diagnostic.message, component?.position),
+      code: diagnostic.code,
+      severity: 'warning',
+      message: diagnostic.message,
+      point: component?.position,
+      wire_ids: [],
+      component_id: diagnostic.component_id,
+    });
+  }
 
   const connectedPins = new Set(
     document.wires.flatMap((wire) => [wire.from, wire.to])

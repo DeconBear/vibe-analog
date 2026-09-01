@@ -2155,6 +2155,20 @@ export function registerProjectHandlers(ipcMain: IpcMain): void {
     return enrichProjectBundle(root, bundle);
   });
 
+  ipcMain.handle('library:resolve-kicad-symbol-ir', async (_event, symbolIds: string[]) => {
+    if (!Array.isArray(symbolIds) || symbolIds.length > 256) {
+      throw new Error('symbolIds must be an array containing at most 256 symbols.');
+    }
+    const uniqueIds = [...new Set(symbolIds.map((value) => String(value).trim()).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      return { schema: 'actoviq.symbol-ir-bundle.v1', definitions: {}, diagnostics: [] };
+    }
+    return runProjectTool([
+      'kicad-symbol-ir',
+      ...uniqueIds.flatMap((symbolId) => ['--symbol', symbolId]),
+    ]);
+  });
+
   ipcMain.handle('project:apply-command', async (_event, projectId: string, command: unknown) => {
     return runProjectTool([
       'apply',

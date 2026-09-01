@@ -321,6 +321,12 @@ export interface CircuitWire {
 }
 
 export interface CircuitComponentEda {
+  symbol?: string;
+  footprint?: string;
+  library?: string;
+  unit?: number;
+  symbol_variant?: number;
+  package_id?: string;
   lcsc_id?: string;
   mpn?: string;
   manufacturer?: string;

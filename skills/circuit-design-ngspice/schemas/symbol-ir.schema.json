@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actoviq.local/schemas/symbol-ir.schema.json",
+  "title": "Actoviq Symbol IR",
+  "type": "object",
+  "required": ["schema", "id", "source", "unit_count", "pin_names", "pin_numbers", "properties", "variants", "diagnostics"],
+  "properties": {
+    "schema": { "const": "actoviq.symbol-ir.v1" },
+    "id": { "type": "string", "pattern": "^[^:]+:.+$" },
+    "source": {
+      "type": "object",
+      "required": ["format", "library", "symbol", "version", "content_hash"],
+      "properties": {
+        "format": { "const": "kicad" },
+        "library": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string", "minLength": 1 },
+        "version": { "type": "string" },
+        "content_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "unit_count": { "type": "integer", "minimum": 1 },
+    "pin_names": { "$ref": "#/$defs/pinVisibility" },
+    "pin_numbers": {
+      "type": "object",
+      "required": ["visible"],
+      "properties": { "visible": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "properties": {
+      "type": "object",
+      "required": ["reference", "value"],
+      "properties": {
+        "reference": { "anyOf": [{ "$ref": "#/$defs/property" }, { "type": "null" }] },
+        "value": { "anyOf": [{ "$ref": "#/$defs/property" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "variants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["unit", "variant", "renderable", "graphics", "pins", "bounds"],
+        "properties": {
+          "unit": { "type": "integer", "minimum": 1 },
+          "variant": { "type": "integer", "minimum": 1 },
+          "renderable": { "type": "boolean" },
+          "graphics": { "type": "array", "items": { "$ref": "#/$defs/graphic" } },
+          "pins": { "type": "array", "items": { "$ref": "#/$defs/pin" } },
+          "bounds": { "$ref": "#/$defs/bounds" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "diagnostics": { "type": "array", "items": { "type": "object" } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "point": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+      "additionalProperties": false
+    },
+    "bounds": {
+      "type": "object",
+      "required": ["minX", "minY", "maxX", "maxY"],
+      "properties": {
+        "minX": { "type": "number" }, "minY": { "type": "number" },
+        "maxX": { "type": "number" }, "maxY": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "effects": {
+      "type": "object",
+      "required": ["font_size", "justify", "bold", "italic", "visible"],
+      "properties": {
+        "font_size": { "type": "number", "minimum": 0 },
+        "justify": { "type": "array", "items": { "type": "string" } },
+        "bold": { "type": "boolean" }, "italic": { "type": "boolean" }, "visible": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "property": {
+      "type": "object",
+      "required": ["at", "angle", "effects"],
+      "properties": {
+        "at": { "$ref": "#/$defs/point" }, "angle": { "type": "number" }, "effects": { "$ref": "#/$defs/effects" }
+      },
+      "additionalProperties": false
+    },
+    "pinVisibility": {
+      "type": "object",
+      "required": ["visible", "offset"],
+      "properties": { "visible": { "type": "boolean" }, "offset": { "type": "number" } },
+      "additionalProperties": false
+    },
+    "stroke": {
+      "type": "object",
+      "required": ["width", "style"],
+      "properties": { "width": { "type": "number", "minimum": 0 }, "style": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "graphic": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["polyline", "rectangle", "circle", "arc", "text"] },
+        "points": { "type": "array", "items": { "$ref": "#/$defs/point" } },
+        "start": { "$ref": "#/$defs/point" }, "mid": { "$ref": "#/$defs/point" }, "end": { "$ref": "#/$defs/point" },
+        "center": { "$ref": "#/$defs/point" }, "radius": { "type": "number", "minimum": 0 },
+        "text": { "type": "string" }, "at": { "$ref": "#/$defs/point" }, "angle": { "type": "number" },
+        "effects": { "$ref": "#/$defs/effects" }, "stroke": { "$ref": "#/$defs/stroke" }, "fill": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "pin": {
+      "type": "object",
+      "required": ["number", "name", "electrical_type", "shape", "at", "angle", "length", "name_effects", "number_effects"],
+      "properties": {
+        "number": { "type": "string" }, "name": { "type": "string" },
+        "electrical_type": { "type": "string" }, "shape": { "type": "string" },
+        "at": { "$ref": "#/$defs/point" }, "angle": { "type": "number" }, "length": { "type": "number", "minimum": 0 },
+        "name_effects": { "$ref": "#/$defs/effects" }, "number_effects": { "$ref": "#/$defs/effects" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

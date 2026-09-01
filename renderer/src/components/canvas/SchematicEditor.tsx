@@ -12,6 +12,7 @@ import {
 } from 'react';
 import type { CircuitComponent, CircuitModule, CircuitPin, CircuitPort, CircuitPosition, CircuitWire, ProjectKind } from '../../types';
 import { SchematicDocumentSvg } from '../../schematic/SchematicDocumentSvg';
+import { useKicadSymbolDefinitions } from '../../schematic/useKicadSymbolDefinitions';
 import {
   applyPdkDeviceToComponent,
   ComponentParamForm,
@@ -443,12 +444,13 @@ export function SchematicEditor({
   const pendingDragPreviewRef = useRef<Record<string, CircuitPosition> | null>(null);
   const previousBaseProjectionRef = useRef<SchematicProjectionSnapshot | null>(null);
   const previousBaseDiagnosticsRef = useRef<LiveErcDiagnostic[] | null>(null);
+  const symbolDefinitions = useKicadSymbolDefinitions(draft);
 
   const baseProjection = useMemo(() => projectSchematicDocumentIncremental(
     draft,
-    { autoLayout: false },
+    { autoLayout: false, symbolDefinitions },
     previousBaseProjectionRef.current,
-  ), [draft]);
+  ), [draft, symbolDefinitions]);
   const baseDocument = baseProjection.document;
   useLayoutEffect(() => {
     previousBaseProjectionRef.current = baseProjection.snapshot;
@@ -510,6 +512,26 @@ export function SchematicEditor({
   const selectedComponent = selection?.kind === 'component'
     ? draft.components.find((component) => component.id === selection.id) ?? null
     : null;
+  const selectedSymbolDefinition = selectedComponent?.eda?.symbol
+    ? baseDocument.symbolDefinitions[selectedComponent.eda.symbol]
+    : undefined;
+  const selectedPackageOptions = useMemo(() => {
+    if (!selectedComponent?.eda?.symbol) return [];
+    const unit = selectedComponent.eda.unit ?? 1;
+    const packages = new Map<string, CircuitComponent[]>();
+    for (const component of draft.components) {
+      const packageId = component.eda?.package_id;
+      if (!packageId || component.eda?.symbol !== selectedComponent.eda.symbol) continue;
+      const members = packages.get(packageId) ?? [];
+      members.push(component);
+      packages.set(packageId, members);
+    }
+    return [...packages.entries()]
+      .filter(([packageId, members]) => packageId === selectedComponent.eda?.package_id
+        || !members.some((member) => (member.eda?.unit ?? 1) === unit))
+      .map(([id, members]) => ({ id, label: `${members[0]?.eda?.refdes ?? members[0]?.name ?? id} · ${id}` }))
+      .sort((left, right) => left.label.localeCompare(right.label));
+  }, [draft.components, selectedComponent]);
   const selectedChildModule = selectedComponent?.type === 'MODULE'
     ? projectModules.find((entry) => (
         entry.module_id === (selectedComponent.module_ref?.module_id || selectedComponent.value)
@@ -2720,11 +2742,93 @@ export function SchematicEditor({
     const component = next.components.find((entry) => entry.id === selectedComponent.id);
     if (!component) return;
     Object.assign(component, patch);
+    const packageId = component.eda?.package_id;
+    if (packageId && (patch.name !== undefined || patch.value !== undefined || patch.eda !== undefined)) {
+      const sharedEdaFields = ['refdes', 'footprint', 'footprint_hint', 'lcsc_id', 'mpn', 'manufacturer'] as const;
+      for (const member of next.components) {
+        if (member.id === component.id || member.eda?.package_id !== packageId) continue;
+        if (patch.name !== undefined) member.name = component.name;
+        if (patch.value !== undefined) member.value = component.value;
+        if (patch.eda !== undefined) {
+          const memberEda = { ...(member.eda ?? {}) };
+          for (const field of sharedEdaFields) {
+            const value = component.eda?.[field];
+            if (value === undefined || value === '') delete memberEda[field];
+            else memberEda[field] = value;
+          }
+          member.eda = memberEda;
+        }
+      }
+    }
     if (patch.rotation !== undefined) {
       component.rotation = normalizeRotation(Number(patch.rotation));
       next.wires = rerouteStoredWires(next, { componentIds: [component.id] });
     }
     commitDraft(next);
+  }
+
+  function changeSelectedSymbolUnit(unit: number) {
+    if (!selectedComponent || !selectedSymbolDefinition || unit === (selectedComponent.eda?.unit ?? 1)) return;
+    const electricallyConnected = (draft.wires ?? []).some((wire) => [wire.from, wire.to].some((endpoint) => (
+      endpoint?.component_id === selectedComponent.id
+    ))) || selectedComponent.pins.some((pin) => (
+      draft.ports.some((port) => port.net === pin.net)
+      || draft.components.some((component) => component.id !== selectedComponent.id
+        && component.pins.some((candidate) => candidate.net === pin.net))
+    ));
+    if (electricallyConnected) {
+      setActionNotice('Disconnect every pin before changing a multi-unit symbol unit.');
+      return;
+    }
+    const target = selectedSymbolDefinition.variants.find((variant) => (
+      variant.unit === unit && variant.variant === (selectedComponent.eda?.symbol_variant ?? 1)
+    ));
+    if (!target) {
+      setActionNotice(`KiCad symbol unit ${unit} is unavailable.`);
+      return;
+    }
+    const packageId = selectedComponent.eda?.package_id;
+    if (packageId && draft.components.some((component) => (
+      component.id !== selectedComponent.id
+      && component.eda?.package_id === packageId
+      && (component.eda.unit ?? 1) === unit
+    ))) {
+      setActionNotice(`Package ${packageId} already contains unit ${unit}.`);
+      return;
+    }
+    const next = cloneModule(draft);
+    const component = next.components.find((entry) => entry.id === selectedComponent.id);
+    if (!component) return;
+    component.eda = { ...(component.eda ?? {}), unit };
+    component.pins = target.pins.map((pin, index) => ({
+      id: pin.number,
+      name: pin.name && pin.name !== '~' ? pin.name : pin.number,
+      net: `nc_${component.id}_${pin.number}`,
+      side: pin.angle === 0 ? 'left' : pin.angle === 180 ? 'right' : pin.angle === 90 ? 'top' : 'bottom',
+      order: index,
+      no_connect: true,
+    }));
+    commitDraft(next);
+    setActionNotice(`Changed ${component.name} to unit ${unit}; all target-unit pins are explicit no-connects.`);
+  }
+
+  function changeSelectedPackage(packageId: string) {
+    if (!selectedComponent || !packageId || packageId === selectedComponent.eda?.package_id) return;
+    const source = draft.components.find((component) => component.eda?.package_id === packageId);
+    if (!source || source.eda?.symbol !== selectedComponent.eda?.symbol) return;
+    const unit = selectedComponent.eda?.unit ?? 1;
+    if (draft.components.some((component) => component.eda?.package_id === packageId && (component.eda.unit ?? 1) === unit)) {
+      setActionNotice(`Package ${packageId} already contains unit ${unit}.`);
+      return;
+    }
+    const sharedFields = ['refdes', 'footprint', 'footprint_hint', 'lcsc_id', 'mpn', 'manufacturer'] as const;
+    const eda = { ...(selectedComponent.eda ?? {}), package_id: packageId };
+    for (const field of sharedFields) {
+      const value = source.eda?.[field];
+      if (value === undefined || value === '') delete eda[field];
+      else eda[field] = value;
+    }
+    updateSelectedComponent({ name: source.name, value: source.value, eda });
   }
 
   function refreshSelectedModuleInstance() {
@@ -3121,7 +3225,10 @@ export function SchematicEditor({
                 {selectedComponent.type}
                 <span style={styles.typeBadgeKind}>{projectKind}</span>
               </div>
-              {selectedComponent.type === 'MODULE' || selectedComponent.type === 'BLOCK' || selectedComponent.type === 'GND' ? (
+              {selectedComponent.type === 'MODULE' || selectedComponent.type === 'GND' || (
+                selectedComponent.type === 'BLOCK'
+                && !(projectKind === 'pcb_schematic' && selectedComponent.eda?.symbol)
+              ) ? (
                 <label style={styles.fieldLabel}>
                   Value
                   <input
@@ -3132,7 +3239,11 @@ export function SchematicEditor({
                     data-testid="schematic-editor-component-value"
                   />
                 </label>
-              ) : (
+              ) : null}
+              {selectedComponent.type !== 'MODULE' && selectedComponent.type !== 'GND' && (
+                selectedComponent.type !== 'BLOCK'
+                || (projectKind === 'pcb_schematic' && selectedComponent.eda?.symbol)
+              ) ? (
                 <ComponentParamForm
                   projectKind={projectKind}
                   component={selectedComponent}
@@ -3142,8 +3253,12 @@ export function SchematicEditor({
                   inputStyle={styles.input ?? {}}
                   hintStyle={styles.paramHint}
                   onPatch={updateSelectedComponent}
+                  symbolDefinition={selectedSymbolDefinition}
+                  packageOptions={selectedPackageOptions}
+                  onUnitChange={changeSelectedSymbolUnit}
+                  onPackageChange={changeSelectedPackage}
                 />
-              )}
+              ) : null}
               <label style={styles.fieldLabel}>
                 Rotation
                 <select
@@ -3294,7 +3409,7 @@ export function SchematicEditor({
                   ) : null}
                 </>
               ) : null}
-              {selectedComponent.type === 'BLOCK' ? (
+              {selectedComponent.type === 'BLOCK' && !(projectKind === 'pcb_schematic' && selectedComponent.eda?.symbol) ? (
                 <>
                   <div style={styles.fieldGrid}>
                     <label style={styles.fieldLabel}>

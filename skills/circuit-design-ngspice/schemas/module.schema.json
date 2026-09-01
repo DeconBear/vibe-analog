@@ -171,6 +171,25 @@
               "refdes": {
                 "type": "string"
               },
+              "symbol": {
+                "type": "string",
+                "pattern": "^[^:]+:.+$"
+              },
+              "library": {
+                "type": "string"
+              },
+              "unit": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "symbol_variant": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "package_id": {
+                "type": "string",
+                "minLength": 1
+              },
               "refdes_prefix": {
                 "type": "string"
               },
