@@ -1,9 +1,9 @@
 /**
- * Per-round assistant text accumulation for desktop ReAct runs.
+ * Per-round assistant text accumulation for desktop agent runs.
  *
- * The actoviq SDK's `response.text.delta` snapshot is scoped to a single ReAct
- * iteration, so a naive accumulator keeps only the last round. This tracker
- * finalizes a round at each `request.started` boundary and prefers the
+ * The actoviq SDK's `response.text.delta` snapshot is scoped to a single
+ * model iteration, so a naive accumulator keeps only the last round. This
+ * tracker finalizes a round at each `request.started` boundary and prefers the
  * authoritative per-iteration summaries from the run result at finalize time.
  */
 

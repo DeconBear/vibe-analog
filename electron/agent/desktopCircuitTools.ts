@@ -28,8 +28,10 @@ async function resolveProjectRoot(projectIdOrRoot: string): Promise<string> {
   return path.resolve(workspace.projectsDir, trimmed);
 }
 
-function textResult(payload: Record<string, unknown>): string {
-  return summarizeToolResult(payload);
+function textResult(payload: unknown): string {
+  return payload && typeof payload === 'object'
+    ? summarizeToolResult(payload as Record<string, unknown>)
+    : String(payload);
 }
 
 const NESTED_OPERATION_NAMES = new Set([
@@ -83,9 +85,10 @@ export function normalizeDesktopOperation(operation: Record<string, unknown>): R
   return operation;
 }
 
-async function run(args: string[], timeoutMs?: number): Promise<string> {
-  const result = await runProjectTool(args, timeoutMs ? { timeoutMs } : undefined);
-  return textResult(result);
+// Keep the raw record for CodeAct host RPC (Python receives a dict). The tool
+// serializer above still provides bounded text to ordinary ReAct/model calls.
+async function run(args: string[], timeoutMs?: number): Promise<Record<string, unknown>> {
+  return runProjectTool(args, timeoutMs ? { timeoutMs } : undefined);
 }
 
 /**
@@ -98,7 +101,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         name: 'workspace_list',
         description: 'List Vibe Analog workspaces available to the desktop app.',
         inputSchema: z.object({}),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async () => run(['workspace-list']),
     ),
@@ -107,7 +110,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         name: 'workspace_active',
         description: 'Show the active workspace (projectsDir used by the GUI).',
         inputSchema: z.object({}),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async () => run(['workspace-active']),
     ),
@@ -118,7 +121,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         inputSchema: z.object({
           workspace_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ workspace_id }) => run(['workspace-use', '--workspace-id', workspace_id]),
     ),
@@ -134,7 +137,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           project_kind: z.enum(['simulation', 'pcb_schematic', 'analog_ic', 'mixed_signal_ic']).default('simulation'),
           demo: z.boolean().optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ name, project_kind, demo }) => {
         const command = demo ? 'create-demo' : 'create';
@@ -146,12 +149,13 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         name: 'agent_context',
         description: [
           'Read the revisioned agent context for a project (protocol, modules, ERC, transaction ops).',
-          'Always call this before apply_circuit_command and use the exact base_revision returned.',
+          'Call exactly once immediately before each apply_circuit_command and use the exact base_revision returned.',
+          'Do not use it as a progress poll before ERC, compile, or simulation; those tools operate on the applied current revision.',
         ].join(' '),
         inputSchema: z.object({
           project_id: z.string().min(1).describe('Project id or absolute project root'),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -165,7 +169,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         inputSchema: z.object({
           project_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -179,8 +183,10 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           'Apply one actoviq.command.v1 transaction to a project.',
           'Provide either command (full object) or operations + base_revision + message.',
           'Each operation MUST be flat: {"op":"upsert_module_netlist","module_id":"...","netlist_notebook":"..."}',
+          'connect_ports MUST use {"op":"connect_ports","from":{"module_id":"...","port_id":"..."},"to":{"module_id":"...","port_id":"..."}}.',
+          'Analysis directives belong in an upsert_module_netlist notebook (for example .ac dec 20 10 10meg); set_analysis is not a supported operation.',
           'Do not nest as {"upsert_module":{...}}. Prefer upsert_module_netlist with a string notebook.',
-          'Never invent base_revision — read it from agent_context first.',
+          'Never invent base_revision — read it from one fresh agent_context call immediately before this transaction.',
         ].join(' '),
         inputSchema: z.object({
           project_id: z.string().min(1),
@@ -190,7 +196,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           message: z.string().optional(),
           command_id: z.string().optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async (input) => {
         const root = await resolveProjectRoot(input.project_id);
@@ -237,7 +243,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         inputSchema: z.object({
           project_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -251,7 +257,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         inputSchema: z.object({
           project_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -267,7 +273,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           module_id: z.string().min(1),
           renderer: z.enum(['netlistsvg', 'grid-experimental']).optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, module_id, renderer }) => {
         const root = await resolveProjectRoot(project_id);
@@ -279,11 +285,11 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
     tool(
       {
         name: 'simulate_circuit_project',
-        description: 'Run ngspice simulation for the project build.',
+        description: 'Run ngspice simulation for the current project build. Required for project-level verification after every repair/recompile; success requires execution_status="success" at the current revision.',
         inputSchema: z.object({
           project_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -293,12 +299,12 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
     tool(
       {
         name: 'simulate_circuit_module',
-        description: 'Run ngspice simulation for one module.',
+        description: 'Run ngspice simulation for one module. This does not replace simulate_circuit_project when project-level verification was requested.',
         inputSchema: z.object({
           project_id: z.string().min(1),
           module_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, module_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -312,7 +318,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         inputSchema: z.object({
           project_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -331,7 +337,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           module_id: z.string().optional(),
           view: z.enum(['design', 'simulation']).default('design'),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async (input) => {
         const root = await resolveProjectRoot(input.project_id);
@@ -358,7 +364,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           view: z.enum(['design', 'simulation']).default('design'),
           output_dir: z.string().optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, module_id, source_revision, view, output_dir }) => {
         const root = await resolveProjectRoot(project_id);
@@ -383,7 +389,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           module_id: z.string().min(1),
           asset_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, module_id, asset_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -400,7 +406,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         name: 'bridge_list',
         description: 'List linked EDA bridges for a project.',
         inputSchema: z.object({ project_id: z.string().min(1) }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -415,7 +421,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           project_id: z.string().min(1),
           peer_kind: z.enum(['kicad', 'jlceda']).optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, peer_kind }) => {
         const root = await resolveProjectRoot(project_id);
@@ -434,7 +440,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           peer_root: z.string().min(1),
           policy: z.enum(['layout_wins', 'connectivity_wins', 'manual_review']).optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, peer_kind, peer_root, policy }) => {
         const root = await resolveProjectRoot(project_id);
@@ -456,7 +462,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           project_id: z.string().min(1),
           peer_kind: z.enum(['kicad', 'jlceda']),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, peer_kind }) => {
         const root = await resolveProjectRoot(project_id);
@@ -472,7 +478,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           peer_kind: z.enum(['kicad', 'jlceda']),
           policy: z.enum(['layout_wins', 'connectivity_wins', 'manual_review']).optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, peer_kind, policy }) => {
         const root = await resolveProjectRoot(project_id);
@@ -489,7 +495,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           query: z.string().min(1),
           use_fallback: z.boolean().optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ query, use_fallback }) => {
         const args = ['lcsc-search', '--query', query];
@@ -505,7 +511,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           lcsc_id: z.string().min(1),
           use_fallback: z.boolean().optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ lcsc_id, use_fallback }) => {
         const args = ['lcsc-get', '--lcsc-id', lcsc_id];
@@ -524,7 +530,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           lcsc_id: z.string().min(1),
           use_fallback: z.boolean().optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async (input) => {
         const root = await resolveProjectRoot(input.project_id);
@@ -544,7 +550,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
         name: 'reference_catalog_list',
         description: 'List workspace reference catalog assets.',
         inputSchema: z.object({}),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async () => run(['reference-catalog-list']),
     ),
@@ -557,7 +563,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           asset_id: z.string().min(1),
           module_id: z.string().optional(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, asset_id, module_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -579,7 +585,7 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           module_id: z.string().min(1),
           asset_id: z.string().min(1),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, module_id, asset_id }) => {
         const root = await resolveProjectRoot(project_id);
@@ -603,11 +609,11 @@ export function createDesktopCircuitTools(options: DesktopCircuitToolsOptions = 
           project_id: z.string().min(1),
           source_revision: z.number().int().nonnegative(),
         }),
-        serialize: (output) => String(output),
+        serialize: textResult,
       },
       async ({ project_id, source_revision }) => {
         const result = await generateTechnicalReport({ projectId: project_id, sourceRevision: source_revision });
-        return textResult(result);
+        return result;
       },
     ));
   }

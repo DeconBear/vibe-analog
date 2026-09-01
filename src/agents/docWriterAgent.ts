@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const docWriterAgent: ActoviqAgentDefinition = {
+export const docWriterAgent: HadamardAgentDefinition = {
   name: 'doc-writer',
   description: 'Write the technical solution document and implementation notes from the structured requirement packet.',
   systemPrompt: [

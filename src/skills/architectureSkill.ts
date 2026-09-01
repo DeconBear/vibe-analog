@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createArchitectureSkill(): ActoviqSkillDefinition {
+export function createArchitectureSkill(): HadamardSkillDefinition {
   return skill({
     name: 'architecture-plan',
     description: 'Produce the implementation architecture, parameter budget, and verification plan for the chosen circuit approach.',

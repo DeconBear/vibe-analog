@@ -1,14 +1,47 @@
-import { app } from 'electron';
+import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
 
 const activeProjectTools = new Set<ChildProcessWithoutNullStreams>();
 
-export function projectScriptPath(appPath = app.getAppPath(), resourcesPath = process.resourcesPath): string {
+interface ElectronAppLike {
+  getAppPath(): string;
+}
+
+/**
+ * Resolve the Electron `app` object when running inside the Electron main
+ * process. Outside Electron (regression harnesses, Node scripts) `require('electron')`
+ * resolves to the binary path string, so fall back to null and let callers
+ * use process.cwd().
+ */
+function resolveElectronApp(): ElectronAppLike | null {
+  try {
+    const electronModule = createRequire(import.meta.url)('electron') as unknown;
+    if (electronModule && typeof electronModule === 'object') {
+      const app = (electronModule as { app?: ElectronAppLike }).app;
+      return app ?? null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+let cachedElectronApp: ElectronAppLike | null | undefined;
+
+function electronApp(): ElectronAppLike | null {
+  if (cachedElectronApp === undefined) cachedElectronApp = resolveElectronApp();
+  return cachedElectronApp;
+}
+
+export function projectScriptPath(
+  appPath = electronApp()?.getAppPath() ?? process.cwd(),
+  resourcesPath = process.resourcesPath ?? '',
+): string {
   const candidates = [
     path.resolve(appPath, 'skills', 'circuit-design-ngspice', 'scripts', 'circuit_project.py'),
-    path.resolve(resourcesPath, 'skills', 'circuit-design-ngspice', 'scripts', 'circuit_project.py'),
+    ...(resourcesPath ? [path.resolve(resourcesPath, 'skills', 'circuit-design-ngspice', 'scripts', 'circuit_project.py')] : []),
   ];
   const candidate = candidates.find((value) => existsSync(value));
   if (!candidate) {
@@ -33,7 +66,7 @@ export function runProjectTool(
 ): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const python = process.env.PYTHON_BIN?.trim() || 'python';
-    const cwd = options.cwd ?? app.getAppPath();
+    const cwd = options.cwd ?? electronApp()?.getAppPath() ?? process.cwd();
     const timeoutMs = options.timeoutMs ?? 120_000;
     const child = spawn(python, [projectScriptPath(), ...args], {
       cwd,

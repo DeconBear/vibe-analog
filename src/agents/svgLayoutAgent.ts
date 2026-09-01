@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const svgLayoutAgent: ActoviqAgentDefinition = {
+export const svgLayoutAgent: HadamardAgentDefinition = {
   name: 'svg-layout-agent',
   description: 'Create scene hints and render a custom SVG schematic using agent-authored layout and A* routing.',
   systemPrompt: [

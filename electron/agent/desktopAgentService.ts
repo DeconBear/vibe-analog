@@ -5,16 +5,18 @@ import { readFile } from 'node:fs/promises';
 import {
   createAgentSdk,
   skill,
-  type ActoviqAgentClient,
+  type HadamardAgentClient,
   type AgentEvent,
   type AgentRunResult,
   type AgentSession,
-  type ActoviqSkillDefinition,
+  type HadamardSkillDefinition,
+  type CreateAgentSdkOptions,
 } from 'actoviq-agent-sdk';
 
 import { createDesktopCircuitTools } from './desktopCircuitTools.js';
 import { createDisabledTaskTool, withAgentFacingToolErrorsForAll } from './toolHelpers.js';
 import { createAssistantRoundTracker, type DesktopAgentRound } from './assistantRounds.js';
+import { createSanitizedProviderModelApi } from './sanitizedModelApi.js';
 
 export type { DesktopAgentRound } from './assistantRounds.js';
 
@@ -23,11 +25,17 @@ const REPORT_AGENT_NAME = 'actoviq-circuit-report-writer';
 const MAX_INITIAL_HISTORY_MESSAGES = 20;
 const MAX_TOOL_ITERATIONS = 60;
 
-const INTENT_SYSTEM_PROMPT = `You are Vibe Analog, the built-in assistant in the Vibe Analog desktop circuit design app.
+type DesktopAgentMode = 'react' | 'codeact' | 'hybrid';
 
-You design and revise circuits by calling tools (ReAct). Tools wrap the same circuit_project.py CLI that external Skill agents use. Do not invent file contents under build/.
+function resolveDesktopAgentMode(): DesktopAgentMode {
+  const override = process.env.VIBE_DESKTOP_AGENT_MODE?.trim().toLowerCase();
+  return override === 'react' || override === 'codeact' || override === 'hybrid' ? override : 'codeact';
+}
 
-Protocol loop (actoviq.project-agent.v2):
+/** The main agent's execution mode. CodeAct by default; override for A/B evaluation. */
+export const DESKTOP_AGENT_MODE: DesktopAgentMode = resolveDesktopAgentMode();
+
+const INTENT_SYSTEM_PROMPT_BODY = `Protocol loop (actoviq.project-agent.v2):
 1. Resolve workspace with workspace_active / workspace_list / workspace_use when needed.
 2. For a new design: create_circuit_project, then agent_context, then apply_circuit_command.
 3. For a revision: agent_context first and use the exact base_revision returned.
@@ -39,9 +47,11 @@ Protocol loop (actoviq.project-agent.v2):
 
 apply_circuit_command operations MUST be flat objects with an "op" field, e.g.
 {"op":"upsert_module_netlist","module_id":"power_stage","name":"Power Stage","netlist_notebook":"..."}.
+connect_ports MUST use {"op":"connect_ports","from":{"module_id":"source","port_id":"out"},"to":{"module_id":"load","port_id":"in"}}.
+Put .ac/.tran analysis directives in an upsert_module_netlist stimulus notebook; there is no set_analysis operation and command-level analyses do not replace a transaction.
 Do NOT nest as {"upsert_module":{...}} or {"add_component":{...}} — that fails apply and leaves 0 modules on the canvas.
 Prefer upsert_module_netlist (netlist_notebook as a single string) over many add_component calls.
-After apply, verify tool JSON shows ok/revision/module count before claiming the canvas has modules.
+After apply, verify the tool result shows ok/revision/module count before claiming the canvas has modules.
 If apply_circuit_command returns status "pending", the transaction is waiting for explicit user review:
 do not run ERC, compile, or simulation against it, and tell the user to accept or reject the proposal in the canvas.
 
@@ -58,6 +68,29 @@ Hard constraints:
 - Prefer concise Chinese or English matching the user.
 - After tools finish, summarize what changed (project id, revision, ERC, sim status, module count) in natural language.
 `;
+
+const INTENT_SYSTEM_PROMPT_CODEACT = `You are Vibe Analog, the built-in assistant in the Vibe Analog desktop circuit design app.
+
+You design and revise circuits through CodeAct: you write Python code cells, and the circuit tools run as typed host functions (the hadamard.<tool_name>(...) stubs in the SDK section). Tool calls return structured Python values - always read them before deciding the next step. Do not invent file contents under build/.
+
+CodeAct discipline:
+- Prefer one coherent Python cell per protocol step (e.g. create + agent_context); assign results to variables and assert preconditions (project id, base_revision, ok flags) before continuing.
+- Call agent_context exactly once immediately before each apply_circuit_command. Reuse that response while building the transaction; after a successful apply, keep the returned project id/revision in Python variables and do not poll agent_context again before ERC, compile, or simulation. Read it again only immediately before the next repair transaction or when the project/revision is genuinely unknown.
+- Call typed hadamard.<tool_name> stubs with keyword arguments only; positional arguments are not supported.
+- Inspect tool results in Python (print or check fields) instead of assuming success; a failed host call raises an error you must handle.
+- Batch independent operations into one transaction, then compile once after the requested design is complete and simulate once after a successful compile. Do not add optional measurements or repeat successful verification unless the user requested them.
+- After any repair transaction, compile and simulate the current revision again. A module-level simulation does not replace simulate_circuit_project when the user requested project verification; claim success only from a current-revision project result with execution_status="success".
+- Keep cells bounded: no unbounded loops, no network access, no filesystem reads outside tool results.
+
+${INTENT_SYSTEM_PROMPT_BODY}`;
+
+const INTENT_SYSTEM_PROMPT_REACT = `You are Vibe Analog, the built-in assistant in the Vibe Analog desktop circuit design app.
+
+You design and revise circuits by calling tools (ReAct). Tools wrap the same circuit_project.py CLI that external Skill agents use. Do not invent file contents under build/.
+
+${INTENT_SYSTEM_PROMPT_BODY}`;
+
+const INTENT_SYSTEM_PROMPT = DESKTOP_AGENT_MODE === 'react' ? INTENT_SYSTEM_PROMPT_REACT : INTENT_SYSTEM_PROMPT_CODEACT;
 
 const REPORT_SYSTEM_PROMPT = `You are the built-in Vibe Analog circuit technical report writer.
 
@@ -161,6 +194,7 @@ export interface DesktopAgentEvent {
   iteration?: number;
   toolName?: string;
   toolUseId?: string;
+  isError?: boolean;
   usage?: Record<string, unknown>;
   rounds?: DesktopAgentRound[];
 }
@@ -173,7 +207,7 @@ export interface DesktopAgentRunHandle {
 interface CachedClient {
   signature: string;
   hasTechnicalReportTool: boolean;
-  client: ActoviqAgentClient;
+  client: HadamardAgentClient;
 }
 
 let cachedClient: CachedClient | null = null;
@@ -206,7 +240,7 @@ function configSignature(
     .digest('hex');
 }
 
-async function loadCircuitDesignSkill(): Promise<ActoviqSkillDefinition | null> {
+async function loadCircuitDesignSkill(): Promise<HadamardSkillDefinition | null> {
   try {
     const skillPath = path.resolve(
       process.cwd(),
@@ -241,7 +275,7 @@ async function loadCircuitDesignSkill(): Promise<ActoviqSkillDefinition | null> 
 async function getClient(
   config: DesktopAgentConfig,
   options: DesktopAgentRunOptions = {},
-): Promise<ActoviqAgentClient> {
+): Promise<HadamardAgentClient> {
   const signature = configSignature(config, options.approvalPolicy);
   const needsTechnicalReportTool = Boolean(options.generateTechnicalReport);
   if (
@@ -251,7 +285,7 @@ async function getClient(
     return cachedClient.client;
   }
 
-  let resolved: ActoviqAgentClient | null = null;
+  let resolved: HadamardAgentClient | null = null;
   clientTransition = clientTransition.then(async () => {
     if (
       cachedClient?.signature === signature
@@ -274,7 +308,7 @@ async function getClient(
       }),
     ]);
     const circuitSkill = await loadCircuitDesignSkill();
-    const client = await createAgentSdk({
+    const sdkOptions: CreateAgentSdkOptions = {
       provider: config.provider,
       apiKey: config.apiKey,
       authToken: config.provider === 'anthropic' ? config.apiKey : undefined,
@@ -292,13 +326,22 @@ async function getClient(
       disableDefaultSkills: true,
       loadDefaultSkillDirectories: false,
       skills: circuitSkill ? [circuitSkill] : [],
+      // Tool approval for circuit mutations is enforced inside apply_circuit_command
+      // (pending-stage transactions under approvalPolicy "manual"), so the SDK-level
+      // gate must not block the CodeCell action space it dispatches through.
+      permissions: [{ toolName: '*', behavior: 'allow', source: 'desktop-agent' }],
       permissionMode: 'default',
       maxToolIterations: MAX_TOOL_ITERATIONS,
+      // Keep the desktop agent on the persistent CodeCell plane. Project-level
+      // PTC settings must not add the stateless run_code action beside CodeCell.
+      toolPresentation: 'native',
       agents: [{
         name: DESKTOP_AGENT_NAME,
-        description: 'Built-in ReAct circuit design agent using Skill-aligned tools.',
+        description: 'Built-in CodeAct circuit design agent driving Skill-aligned tools from Python cells.',
         systemPrompt: INTENT_SYSTEM_PROMPT,
         model: config.model,
+        agentMode: DESKTOP_AGENT_MODE,
+        toolPresentation: 'native',
         tools: circuitTools,
         allowedTools: circuitTools.map((entry) => entry.name),
         mcpServers: [],
@@ -322,7 +365,11 @@ async function getClient(
         maxToolIterations: 0,
         source: 'custom',
       }],
-    });
+    };
+    // Provider error bodies can echo credentials; the SDK persists raw run
+    // errors into its on-disk audit store, so redact at the ModelApi boundary.
+    sdkOptions.modelApi = await createSanitizedProviderModelApi(sdkOptions);
+    const client = await createAgentSdk(sdkOptions);
     cachedClient = {
       signature,
       hasTechnicalReportTool: needsTechnicalReportTool,
@@ -335,11 +382,11 @@ async function getClient(
   return resolved;
 }
 
-async function getReportClient(config: DesktopAgentConfig): Promise<ActoviqAgentClient> {
+async function getReportClient(config: DesktopAgentConfig): Promise<HadamardAgentClient> {
   const signature = configSignature(config);
   if (cachedReportClient?.signature === signature) return cachedReportClient.client;
 
-  let resolved: ActoviqAgentClient | null = null;
+  let resolved: HadamardAgentClient | null = null;
   reportClientTransition = reportClientTransition.then(async () => {
     if (cachedReportClient?.signature === signature) {
       resolved = cachedReportClient.client;
@@ -351,7 +398,7 @@ async function getReportClient(config: DesktopAgentConfig): Promise<ActoviqAgent
     }
     const workDir = path.resolve(config.workDir || process.cwd());
     const homeDir = path.resolve(config.homeDir || path.join(homedir(), '.actoviq'));
-    const client = await createAgentSdk({
+    const reportSdkOptions: CreateAgentSdkOptions = {
       provider: config.provider,
       apiKey: config.apiKey,
       authToken: config.provider === 'anthropic' ? config.apiKey : undefined,
@@ -384,7 +431,9 @@ async function getReportClient(config: DesktopAgentConfig): Promise<ActoviqAgent
         maxToolIterations: 0,
         source: 'custom',
       }],
-    });
+    };
+    reportSdkOptions.modelApi = await createSanitizedProviderModelApi(reportSdkOptions);
+    const client = await createAgentSdk(reportSdkOptions);
     cachedReportClient = { signature, client };
     resolved = client;
   });
@@ -400,7 +449,7 @@ function normalizeSessionId(conversationId: string): string {
 }
 
 async function getSession(
-  client: ActoviqAgentClient,
+  client: HadamardAgentClient,
   config: DesktopAgentConfig,
   input: DesktopAgentRunInput,
 ): Promise<AgentSession> {
@@ -486,7 +535,7 @@ function extractTouchedProjectId(toolName: string, input: unknown): string | und
 export function sanitizeAgentError(error: unknown): string {
   const source = error instanceof Error ? error.message : String(error);
   return source
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/\b(?:sk|ark|ak)-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
     .replace(/(bearer\s+)[A-Za-z0-9._~+\/-]+/gi, '$1[redacted]')
     .replace(/((?:api[_ -]?key|auth[_ -]?token)\s*[:=]\s*)[^\s,;]+/gi, '$1[redacted]')
     .slice(0, 1200);
@@ -581,6 +630,16 @@ export function startDesktopAgentRun(
           const name = sdkEvent.call.name;
           const fromInput = extractTouchedProjectId(name, sdkEvent.call.input);
           if (fromInput) touchedProjectId = fromInput;
+          if (name === 'CodeCell') {
+            // CodeAct outer action: the host sub-calls below carry the user-visible labels.
+            emit({
+              type: 'status',
+              runId: sdkEvent.runId,
+              iteration: sdkEvent.iteration,
+              label: 'Executing Python cell',
+            });
+            break;
+          }
           emit({
             type: 'tool-call',
             runId: sdkEvent.runId,
@@ -591,8 +650,32 @@ export function startDesktopAgentRun(
           });
           break;
         }
+        case 'tool.code_dispatch': {
+          // CodeAct host sub-call result. The nested executor already emits
+          // tool.call for the sub-call; only the settle carries the outcome.
+          if (sdkEvent.phase !== 'settle') break;
+          let resultLabel = toolLabel(sdkEvent.name, 'result');
+          if (sdkEvent.summary) {
+            const match = /"project_id"\s*:\s*"([^"]+)"/.exec(sdkEvent.summary);
+            if (match?.[1]) {
+              touchedProjectId = match[1];
+              resultLabel = `${resultLabel} · ${match[1]}`;
+            }
+          }
+          emit({
+            type: 'tool-result',
+            runId: sdkEvent.runId,
+            iteration: sdkEvent.iteration,
+            toolName: sdkEvent.name,
+            toolUseId: sdkEvent.subCallId,
+            isError: sdkEvent.isError,
+            label: sdkEvent.isError ? `${resultLabel} · error` : resultLabel,
+          });
+          break;
+        }
         case 'tool.result': {
           const name = sdkEvent.result.name;
+          if (name === 'CodeCell') break; // sub-dispatch events already surfaced the host tools
           let resultLabel = toolLabel(name, 'result');
           // Best-effort: parse create/result JSON for project id
           try {
@@ -615,7 +698,8 @@ export function startDesktopAgentRun(
             iteration: sdkEvent.iteration,
             toolName: name,
             toolUseId: sdkEvent.result.id,
-            label: resultLabel,
+            isError: sdkEvent.result.isError,
+            label: sdkEvent.result.isError ? `${resultLabel} · error` : resultLabel,
           });
           break;
         }
@@ -729,7 +813,7 @@ export function startDesktopAgentRun(
 export async function closeDesktopAgentService(): Promise<void> {
   await Promise.all([clientTransition, reportClientTransition]);
   const clients = [cachedClient?.client, cachedReportClient?.client].filter(
-    (client): client is ActoviqAgentClient => Boolean(client),
+    (client): client is HadamardAgentClient => Boolean(client),
   );
   cachedClient = null;
   cachedReportClient = null;

@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const jobSluggerAgent: ActoviqAgentDefinition = {
+export const jobSluggerAgent: HadamardAgentDefinition = {
   name: 'job-slugger',
   description: 'Generate short English filesystem-safe names for workflow jobs and custom artifacts.',
   systemPrompt: [

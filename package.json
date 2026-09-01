@@ -33,6 +33,7 @@
     "electron:dist:mac": "npm run build:all && electron-builder --config electron-builder.yml --mac",
     "test": "npm run typecheck && npm run test:unit",
     "test:unit": "tsx src/tests/runTests.ts",
+    "test:desktop-agent": "tsx scripts/desktop-agent-service-regression.ts",
     "test:schematic-document": "tsx scripts/schematic-document-regression.ts",
     "test:live-erc-backend": "python scripts/live-erc-regression.py",
     "test:schematic-golden": "tsx scripts/schematic-document-golden.ts",
@@ -99,7 +100,7 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
-    "actoviq-agent-sdk": "^0.4.7",
+    "actoviq-agent-sdk": "^0.4.22",
     "highlight.js": "^11.11.1",
     "lucide-react": "^0.468.0",
     "marked": "^18.0.3",

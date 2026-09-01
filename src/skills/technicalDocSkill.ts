@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createTechnicalDocSkill(): ActoviqSkillDefinition {
+export function createTechnicalDocSkill(): HadamardSkillDefinition {
   return skill({
     name: 'technical-doc-package',
     description: 'Write the technical solution document and execution checklist for the requested circuit job.',

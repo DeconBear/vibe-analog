@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const netlistsvgRendererAgent: ActoviqAgentDefinition = {
+export const netlistsvgRendererAgent: HadamardAgentDefinition = {
   name: 'netlistsvg-renderer',
   description: 'Convert the final netlist into SVG using netlistsvg and write rendering notes.',
   systemPrompt: [

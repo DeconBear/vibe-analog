@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createRenderSchemdrawSkill(): ActoviqSkillDefinition {
+export function createRenderSchemdrawSkill(): HadamardSkillDefinition {
   return skill({
     name: 'render-schematic-schemdraw',
     description: 'Generate the design JSON and render the schematic SVG through the schemdraw pipeline.',

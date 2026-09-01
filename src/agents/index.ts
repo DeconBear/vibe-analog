@@ -1,4 +1,4 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
 import { architectAgent } from './architectAgent.js';
 import { docWriterAgent } from './docWriterAgent.js';
@@ -13,7 +13,7 @@ import { solutionAnalystAgent } from './solutionAnalystAgent.js';
 import { svgLayoutAgent } from './svgLayoutAgent.js';
 import { workflowLeadAgent } from './workflowLeadAgent.js';
 
-export function getWorkflowAgents(): ActoviqAgentDefinition[] {
+export function getWorkflowAgents(): HadamardAgentDefinition[] {
   return [
     jobSluggerAgent,
     errorExplainerAgent,

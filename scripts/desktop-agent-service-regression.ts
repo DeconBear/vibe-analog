@@ -3,13 +3,23 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import {
+
+/**
+ * Isolate the workspace before importing the desktop agent service (the
+ * module reads ACTOVIQ_E2E_WORKSPACE_ROOT at load time).
+ */
+const e2eWorkspaceRoot = await mkdtemp(path.join(tmpdir(), 'actoviq-agent-regression-ws-'));
+process.env.ACTOVIQ_E2E_WORKSPACE_ROOT = e2eWorkspaceRoot;
+
+const {
   closeDesktopAgentService,
   generateDesktopTechnicalReport,
   startDesktopAgentRun,
-  type DesktopAgentChatResponse,
-  type DesktopAgentConfig,
-  type DesktopAgentEvent,
+} = await import('../electron/agent/desktopAgentService.ts');
+import type {
+  DesktopAgentChatResponse,
+  DesktopAgentConfig,
+  DesktopAgentEvent,
 } from '../electron/agent/desktopAgentService.ts';
 
 interface RecordedRequest {
@@ -26,12 +36,12 @@ interface MockServer {
 
 const DESIGN_MARKER = 'DESIGN_SCENARIO';
 const FOLLOWUP_MARKER = 'FOLLOWUP_SCENARIO';
-const REPAIR_MARKER = 'REPAIR_SCENARIO';
 const CANCEL_MARKER = 'CANCEL_SCENARIO';
 const LEAK_MARKER = 'LEAK_SCENARIO';
 const REPORT_MARKER = 'ACTOVIQ_REPORT_REGRESSION_MARKER';
+const DESIGN_PROJECT_NAME = 'Mock RC Regression';
 
-function openAiChunk(id: string, model: string, content: string, finishReason: string | null = null) {
+function openAiChunk(id: string, model: string, delta: Record<string, unknown>, finishReason: string | null = null) {
   return {
     id,
     object: 'chat.completion.chunk',
@@ -39,7 +49,7 @@ function openAiChunk(id: string, model: string, content: string, finishReason: s
     model,
     choices: [{
       index: 0,
-      delta: content ? { content } : {},
+      delta,
       finish_reason: finishReason,
     }],
   };
@@ -60,25 +70,37 @@ function serializedMessages(body: Record<string, unknown>): string {
   return JSON.stringify(body.messages ?? []);
 }
 
-function sendStreamingJson(response: ServerResponse, value: Record<string, unknown>): void {
-  const id = `chatcmpl_mock_${Date.now()}`;
-  const model = 'mock-circuit-v1';
-  const content = JSON.stringify(value);
+function writeSseHead(response: ServerResponse): void {
   response.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache',
     connection: 'keep-alive',
   });
-  writeEvent(response, {
-    ...openAiChunk(id, model, ''),
-    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-  });
-  for (let offset = 0; offset < content.length; offset += 9) {
-    writeEvent(response, openAiChunk(id, model, content.slice(offset, offset + 9)));
+}
+
+function sendStreamingToolCall(
+  response: ServerResponse,
+  callId: string,
+  name: string,
+  args: Record<string, unknown>,
+): void {
+  const id = `chatcmpl_mock_${Date.now()}`;
+  const model = 'mock-circuit-v1';
+  writeSseHead(response);
+  writeEvent(response, openAiChunk(id, model, { role: 'assistant' }));
+  writeEvent(response, openAiChunk(id, model, {
+    tool_calls: [{ index: 0, id: callId, type: 'function', function: { name, arguments: '' } }],
+  }));
+  const serialized = JSON.stringify(args);
+  for (let offset = 0; offset < serialized.length; offset += 17) {
+    writeEvent(response, openAiChunk(id, model, {
+      tool_calls: [{ index: 0, function: { arguments: serialized.slice(offset, offset + 17) } }],
+    }));
   }
+  writeEvent(response, openAiChunk(id, model, {}, 'tool_calls'));
   writeEvent(response, {
-    ...openAiChunk(id, model, '', 'stop'),
-    usage: { prompt_tokens: 31, completion_tokens: 17, total_tokens: 48 },
+    ...openAiChunk(id, model, {}),
+    usage: { prompt_tokens: 71, completion_tokens: 23, total_tokens: 94 },
   });
   response.write('data: [DONE]\n\n');
   response.end();
@@ -87,20 +109,14 @@ function sendStreamingJson(response: ServerResponse, value: Record<string, unkno
 function sendStreamingText(response: ServerResponse, content: string): void {
   const id = `chatcmpl_mock_${Date.now()}`;
   const model = 'mock-circuit-v1';
-  response.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive',
-  });
-  writeEvent(response, {
-    ...openAiChunk(id, model, ''),
-    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-  });
+  writeSseHead(response);
+  writeEvent(response, openAiChunk(id, model, { role: 'assistant' }));
   for (let offset = 0; offset < content.length; offset += 17) {
-    writeEvent(response, openAiChunk(id, model, content.slice(offset, offset + 17)));
+    writeEvent(response, openAiChunk(id, model, { content: content.slice(offset, offset + 17) }));
   }
+  writeEvent(response, openAiChunk(id, model, {}, 'stop'));
   writeEvent(response, {
-    ...openAiChunk(id, model, '', 'stop'),
+    ...openAiChunk(id, model, {}),
     usage: { prompt_tokens: 61, completion_tokens: 43, total_tokens: 104 },
   });
   response.write('data: [DONE]\n\n');
@@ -126,17 +142,9 @@ function sendCompletionText(response: ServerResponse, content: string): void {
 async function sendCancellableStream(response: ServerResponse): Promise<void> {
   const id = `chatcmpl_cancel_${Date.now()}`;
   const model = 'mock-circuit-v1';
-  response.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive',
-  });
-  writeEvent(response, {
-    ...openAiChunk(id, model, ''),
-    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-  });
-  writeEvent(response, openAiChunk(id, model, '{"text":"Waiting for cancellation'));
-
+  writeSseHead(response);
+  writeEvent(response, openAiChunk(id, model, { role: 'assistant' }));
+  writeEvent(response, openAiChunk(id, model, { content: 'Waiting for cancellation' }));
   await new Promise<void>((resolve) => {
     let settled = false;
     const finish = () => {
@@ -147,7 +155,7 @@ async function sendCancellableStream(response: ServerResponse): Promise<void> {
     };
     const timer = setTimeout(() => {
       if (!response.destroyed) {
-        writeEvent(response, openAiChunk(id, model, ' timed out","isDesignRequest":false}', 'stop'));
+        writeEvent(response, openAiChunk(id, model, { content: ' timed out' }, 'stop'));
         response.write('data: [DONE]\n\n');
         response.end();
       }
@@ -170,16 +178,12 @@ async function startMockServer(expectedToken: string): Promise<MockServer> {
       const authorized = request.headers.authorization === `Bearer ${expectedToken}`;
       let scenario = 'unknown';
 
-      if (messages.includes('previous answer did not match the required JSON schema')) {
-        scenario = 'repair-corrected';
-      } else if (messages.includes(CANCEL_MARKER)) {
+      if (messages.includes(CANCEL_MARKER)) {
         scenario = 'cancel';
       } else if (messages.includes(LEAK_MARKER)) {
         scenario = 'leak-error';
       } else if (messages.includes(FOLLOWUP_MARKER)) {
         scenario = 'followup';
-      } else if (messages.includes(REPAIR_MARKER)) {
-        scenario = 'repair-invalid';
       } else if (messages.includes('Verified evidence JSON:')) {
         scenario = 'technical-report';
       } else if (messages.includes(DESIGN_MARKER)) {
@@ -201,27 +205,6 @@ async function startMockServer(expectedToken: string): Promise<MockServer> {
       }
       if (scenario === 'cancel') {
         await sendCancellableStream(response);
-        return;
-      }
-      if (scenario === 'repair-invalid') {
-        sendStreamingJson(response, { text: 17, projectOperations: 'invalid' });
-        return;
-      }
-      if (scenario === 'repair-corrected') {
-        sendStreamingJson(response, {
-          text: 'The structured circuit transaction was repaired.',
-          isDesignRequest: true,
-          isRevisionRequest: false,
-          formalizedRequirement: 'Create a mock current limiter.',
-          projectKind: 'simulation',
-          projectOperations: [{
-            op: 'upsert_module_netlist',
-            module_id: 'current-limiter',
-            notebook: '```spice\nR1 IN OUT 100\n.end\n```',
-          }],
-          compileAfterApply: true,
-          simulateAfterApply: false,
-        });
         return;
       }
       if (scenario === 'technical-report') {
@@ -256,38 +239,31 @@ async function startMockServer(expectedToken: string): Promise<MockServer> {
         return;
       }
       if (scenario === 'followup') {
-        sendStreamingJson(response, {
-          text: 'Prepared a revision that changes the resistor value.',
-          isDesignRequest: false,
-          isRevisionRequest: true,
-          revisionRequest: 'Change R1 from 1k to 2k.',
-          projectOperations: [{
-            op: 'set_module_component_value',
-            module_id: 'rc-filter',
-            component_id: 'R1',
-            value: '2k',
-          }],
-          compileAfterApply: true,
-          simulateAfterApply: true,
-        });
+        sendStreamingText(response, 'Prepared a revision plan. Awaiting the apply transaction.');
         return;
       }
       if (scenario === 'design') {
-        sendStreamingJson(response, {
-          text: 'Created a validated RC low-pass transaction.',
-          isDesignRequest: true,
-          isRevisionRequest: false,
-          formalizedRequirement: 'Create an RC low-pass filter.',
-          projectName: 'Mock RC',
-          projectKind: 'simulation',
-          projectOperations: [{
-            op: 'upsert_module_netlist',
-            module_id: 'rc-filter',
-            notebook: '```spice\nR1 IN OUT 1k\nC1 OUT 0 1u\n.end\n```',
-          }],
-          compileAfterApply: true,
-          simulateAfterApply: false,
-        });
+        // First model turn: request project creation through a CodeAct cell.
+        // Follow-up turns (messages already carry the CodeCell result) summarize it.
+        const hasToolResult = messages.includes('"role":"tool"') || messages.includes('"role": "tool"');
+        if (!hasToolResult) {
+          sendStreamingToolCall(response, 'call_mock_create', 'CodeCell', {
+            language: 'python',
+            code: [
+              'import json',
+              'created = hadamard.create_circuit_project(',
+              `    name="${DESIGN_PROJECT_NAME}",`,
+              '    project_kind="simulation",',
+              ')',
+              'assert isinstance(created, dict), type(created)',
+              'print(json.dumps(created))',
+            ].join('\n'),
+          });
+          return;
+        }
+        const projectIdMatch = /"project_id"\s*:\s*"([^"]+)"/.exec(messages);
+        const projectId = projectIdMatch?.[1] ?? 'unknown-project';
+        sendStreamingText(response, `Created circuit project ${projectId} and verified the tool result.`);
         return;
       }
 
@@ -398,12 +374,15 @@ async function runMockRegression(): Promise<void> {
     allEvents.push(...first.events);
     allResults.push(firstResult);
     assert.equal(firstResult.isError, undefined);
-    assert.equal(firstResult.isDesignRequest, true);
-    assert.equal(firstResult.projectKind, 'simulation');
-    assert.equal(firstResult.projectOperations?.[0]?.op, 'upsert_module_netlist');
+    assert(firstResult.text.includes('Created circuit project'), 'the final text must summarize the tool result');
+    assert.match(firstResult.touchedProjectId ?? '', /^mock-rc-regression$/, 'the project id must be extracted from tool results');
     assert(first.events.some((event) => event.type === 'run-started'));
     assert(first.events.some((event) => event.type === 'status'));
-    assert(first.events.filter((event) => event.type === 'text-progress').length >= 2);
+    assert(first.events.some((event) => event.type === 'tool-call' && event.toolName === 'create_circuit_project'),
+      'the CodeAct cell must dispatch the create_circuit_project host tool');
+    assert(first.events.some((event) => event.type === 'tool-result' && event.toolName === 'create_circuit_project'));
+    assert(first.events.some((event) => event.type === 'status' && event.label === 'Executing Python cell'));
+    assert(first.events.filter((event) => event.type === 'text-progress').length >= 1);
     assert(first.events.some((event) => event.type === 'usage'));
     assert.equal(first.events.at(-1)?.type, 'completed');
     assertOrderedEvents(first.events, 'conversation-persistent');
@@ -412,31 +391,24 @@ async function runMockRegression(): Promise<void> {
     const secondResult = await second.handle.result;
     allEvents.push(...second.events);
     allResults.push(secondResult);
-    assert.equal(secondResult.isRevisionRequest, true);
-    assert.equal(secondResult.projectOperations?.[0]?.op, 'set_module_component_value');
+    assert.equal(secondResult.isError, undefined);
     assert.equal(secondResult.sessionId, firstResult.sessionId, 'a conversation must reuse its SDK session');
     assertOrderedEvents(second.events, 'conversation-persistent');
 
-    const designRequest = mock.requests.find((request) => request.scenario === 'design');
-    const followupRequest = mock.requests.find((request) => request.scenario === 'followup');
-    assert(designRequest && followupRequest);
-    const firstMessages = designRequest.body.messages as unknown[];
-    const secondMessages = followupRequest.body.messages as unknown[];
+    const designRequests = mock.requests.filter((request) => request.scenario === 'design');
+    assert(designRequests.length === 2, 'the design turn must perform one model round trip per ReAct iteration');
+    const firstMessages = designRequests[0]?.body.messages as unknown[];
+    const secondMessages = designRequests[1]?.body.messages as unknown[];
     assert(Array.isArray(firstMessages) && Array.isArray(secondMessages));
-    assert(secondMessages.length > firstMessages.length, 'the second request must include persisted session history');
-    assert(serializedMessages(followupRequest.body).includes('Created a validated RC low-pass transaction.'));
-    assert.equal(Array.isArray(designRequest.body.tools) && designRequest.body.tools.length > 0, false);
-
-    const repair = startRun(config, 'conversation-repair', `${REPAIR_MARKER}: create a current limiter.`);
-    const repairResult = await repair.handle.result;
-    allEvents.push(...repair.events);
-    allResults.push(repairResult);
-    assert.equal(repairResult.isError, undefined);
-    assert.equal(repairResult.projectOperations?.[0]?.op, 'upsert_module_netlist');
-    assert(repair.events.some((event) => event.type === 'retry'));
-    assert.equal(mock.requests.filter((request) => request.scenario === 'repair-invalid').length, 1);
-    assert.equal(mock.requests.filter((request) => request.scenario === 'repair-corrected').length, 1);
-    assertOrderedEvents(repair.events, 'conversation-repair');
+    assert(secondMessages.length > firstMessages.length, 'the second request must include the tool result');
+    assert(serializedMessages(designRequests[1]?.body ?? {}).includes('"role":"tool"'),
+      'the tool result must be fed back to the model');
+    const designTools = designRequests[0]?.body.tools as Array<{ function?: { name?: string } }> | undefined;
+    assert.deepEqual(
+      designTools?.map((entry) => entry.function?.name),
+      ['CodeCell'],
+      'codeact mode must expose only the persistent CodeCell action plane',
+    );
 
     const cancellable = startRun(config, 'conversation-cancel', `${CANCEL_MARKER}: wait until stopped.`);
     await waitForEvent(cancellable.events, 'text-progress');
@@ -457,6 +429,7 @@ async function runMockRegression(): Promise<void> {
     allEvents.push(...leakingError.events);
     allResults.push(leakingResult);
     assert.equal(leakingResult.isError, true);
+    assert(!leakingResult.text.includes(secret), 'the sanitized error must not echo the credential');
     assert(leakingError.events.some((event) => event.type === 'error'));
     assertOrderedEvents(leakingError.events, 'conversation-error');
 
@@ -474,7 +447,8 @@ async function runMockRegression(): Promise<void> {
     assert.equal(reportResult.model, config.model);
     const reportRequest = mock.requests.find((request) => request.scenario === 'technical-report');
     assert(reportRequest);
-    assert.equal(Array.isArray(reportRequest.body.tools) && reportRequest.body.tools.length > 0, false);
+    assert.equal(Array.isArray(reportRequest.body.tools) && reportRequest.body.tools.length > 0, false,
+      'the report agent must run without tools');
     assertSecretAbsentFromValues(secret, [reportResult]);
 
     assert(mock.requests.every((request) => request.authorized));
@@ -485,13 +459,14 @@ async function runMockRegression(): Promise<void> {
     await closeDesktopAgentService();
     await mock.close();
     await rm(homeDir, { recursive: true, force: true });
+    await rm(e2eWorkspaceRoot, { recursive: true, force: true });
   }
 }
 
-async function runLiveDeepSeekSmoke(): Promise<'passed' | 'skipped'> {
-  if (process.env.ACTOVIQ_LIVE_DEEPSEEK !== '1') return 'skipped';
+async function runLiveProviderSmoke(): Promise<'passed' | 'skipped'> {
+  if (process.env.ACTOVIQ_LIVE_PROVIDER !== '1') return 'skipped';
   const apiKey = process.env.ACTOVIQ_API_KEY?.trim();
-  assert(apiKey, 'ACTOVIQ_API_KEY is required when ACTOVIQ_LIVE_DEEPSEEK=1');
+  assert(apiKey, 'ACTOVIQ_API_KEY is required when ACTOVIQ_LIVE_PROVIDER=1');
   const homeDir = await mkdtemp(path.join(tmpdir(), 'actoviq-live-agent-test-'));
   const events: DesktopAgentEvent[] = [];
   let result: DesktopAgentChatResponse | undefined;
@@ -499,8 +474,8 @@ async function runLiveDeepSeekSmoke(): Promise<'passed' | 'skipped'> {
     const handle = startDesktopAgentRun({
       provider: 'openai',
       apiKey,
-      baseURL: process.env.ACTOVIQ_BASE_URL?.trim() || 'https://api.deepseek.com',
-      model: process.env.ACTOVIQ_MODEL?.trim() || 'deepseek-chat',
+      baseURL: process.env.ACTOVIQ_BASE_URL?.trim() || 'https://ark.cn-beijing.volces.com/api/plan',
+      model: process.env.ACTOVIQ_MODEL?.trim() || 'glm-5.3',
       homeDir,
       workDir: process.cwd(),
     }, {
@@ -524,8 +499,8 @@ async function runLiveDeepSeekSmoke(): Promise<'passed' | 'skipped'> {
 
 async function main(): Promise<void> {
   await runMockRegression();
-  const liveStatus = await runLiveDeepSeekSmoke();
-  console.log(`desktop agent SDK regression: passed (live DeepSeek: ${liveStatus})`);
+  const liveStatus = await runLiveProviderSmoke();
+  console.log(`desktop agent SDK regression: passed (live provider: ${liveStatus})`);
 }
 
 main().catch((error) => {

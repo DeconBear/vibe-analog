@@ -1,4 +1,4 @@
-import type { ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import type { HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
 import { createArchitectureSkill } from './architectureSkill.js';
 import { createAssetReuseSkill } from './assetReuseSkill.js';
@@ -14,7 +14,7 @@ import { createRequirementsToSpecSkill } from './requirementsToSpecSkill.js';
 import { createTechnicalDocSkill } from './technicalDocSkill.js';
 import { createVisionLayoutReviewSkill } from './visionLayoutReviewSkill.js';
 
-export function getWorkflowSkills(): ActoviqSkillDefinition[] {
+export function getWorkflowSkills(): HadamardSkillDefinition[] {
   return [
     createJobSlugSkill(),
     createRequirementsToSpecSkill(),

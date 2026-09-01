@@ -432,32 +432,52 @@ async function startMockProvider() {
           '```',
         ].join('\n');
         const steps = [
-          ['create_circuit_project', { name: projectName, project_kind: 'simulation' }],
-          ['agent_context', { project_id: projectId }],
-          ['apply_circuit_command', {
-            project_id: projectId,
-            base_revision: 0,
-            message: 'Create and verify a first-order RC low-pass filter.',
-            operations: [{
-              op: 'upsert_module_netlist',
-              module_id: 'filter',
-              name: 'RC low-pass filter',
-              kind: 'filter',
-              function: 'First-order low-pass response with a nominal 1.59 kHz cutoff.',
-              netlist_notebook: notebook,
-            }],
-          }],
-          ['run_erc', { project_id: projectId }],
-          ['compile_circuit_project', { project_id: projectId }],
-          ['simulate_circuit_project', { project_id: projectId }],
-          ['generate_technical_report', { project_id: projectId, source_revision: 1 }],
+          [
+            `created = hadamard.create_circuit_project(name=${JSON.stringify(projectName)}, project_kind="simulation")`,
+            'print(created)',
+          ].join('\n'),
+          [
+            `ctx = hadamard.agent_context(project_id=${JSON.stringify(projectId)})`,
+            'print(ctx)',
+          ].join('\n'),
+          [
+            `result = hadamard.apply_circuit_command(`,
+            `    project_id=${JSON.stringify(projectId)},`,
+            '    base_revision=0,',
+            '    message="Create and verify a first-order RC low-pass filter.",',
+            '    operations=[{',
+            '        "op": "upsert_module_netlist",',
+            '        "module_id": "filter",',
+            '        "name": "RC low-pass filter",',
+            '        "kind": "filter",',
+            '        "function": "First-order low-pass response with a nominal 1.59 kHz cutoff.",',
+            `        "netlist_notebook": ${JSON.stringify(notebook)},`,
+            '    }],',
+            ')',
+            'print(result)',
+          ].join('\n'),
+          [
+            `erc = hadamard.run_erc(project_id=${JSON.stringify(projectId)})`,
+            'print(erc)',
+          ].join('\n'),
+          [
+            `build = hadamard.compile_circuit_project(project_id=${JSON.stringify(projectId)})`,
+            'print(build)',
+          ].join('\n'),
+          [
+            `sim = hadamard.simulate_circuit_project(project_id=${JSON.stringify(projectId)})`,
+            'print(sim)',
+          ].join('\n'),
+          [
+            `report = hadamard.generate_technical_report(project_id=${JSON.stringify(projectId)}, source_revision=1)`,
+            'print(report)',
+          ].join('\n'),
         ];
         const step = steps[circuitDesignStep];
         circuitDesignStep += 1;
         if (step) {
-          const [name, input] = step;
-          assert(toolNames.includes(name), `desktop ReAct request is missing ${name}`);
-          sendToolCall(response, body, name, input);
+          assert(toolNames.includes('CodeCell'), 'desktop CodeAct request is missing CodeCell');
+          sendToolCall(response, body, 'CodeCell', { language: 'python', code: step });
           return;
         }
         sendProviderText(
@@ -1022,17 +1042,9 @@ try {
   assert.equal(circuitRequests.length, 8);
   assert(circuitRequests.every((request) => request.stream === true));
   assert(circuitRequests.every((request) => request.tools > 0));
-  for (const toolName of [
-    'create_circuit_project',
-    'agent_context',
-    'apply_circuit_command',
-    'run_erc',
-    'compile_circuit_project',
-    'simulate_circuit_project',
-    'generate_technical_report',
-  ]) {
-    assert(circuitRequests.every((request) => request.toolNames.includes(toolName)));
-  }
+  assert(circuitRequests.every((request) => (
+    request.toolNames.length === 1 && request.toolNames[0] === 'CodeCell'
+  )), 'the desktop agent must expose only the CodeCell tool in CodeAct mode');
   const technicalReportRequest = mock.requests.find((request) => request.scenario === 'technical-report');
   assert(technicalReportRequest);
   assert.equal(technicalReportRequest.stream, false);

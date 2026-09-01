@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { createAgentSdk, type ActoviqAgentClient, type AgentRunResult, type AgentSession } from 'actoviq-agent-sdk';
+import { createAgentSdk, type HadamardAgentClient, type AgentRunResult, type AgentSession } from 'actoviq-agent-sdk';
 
 import { jobSluggerAgent } from '../agents/jobSluggerAgent.js';
 import { PROJECT_ROOT, WORKSPACE_ROOT } from '../config/projectPaths.js';
@@ -79,7 +79,7 @@ async function drainQuietly(stream: AsyncIterable<unknown> & { result: Promise<A
   return guardedResult;
 }
 
-async function createNamingSdk(sessionDirectory: string): Promise<ActoviqAgentClient> {
+async function createNamingSdk(sessionDirectory: string): Promise<HadamardAgentClient> {
   return createAgentSdk({
     workDir: WORKSPACE_ROOT,
     sessionDirectory,
@@ -106,7 +106,7 @@ export async function generateSafeJobNaming(options: {
   sessionDirectory: string;
 }): Promise<GeneratedJobNaming> {
   const fallback = defaultFallbackSlug(options.requirement, options.explicitName);
-  let sdk: ActoviqAgentClient | null = null;
+  let sdk: HadamardAgentClient | null = null;
 
   try {
     sdk = await createNamingSdk(options.sessionDirectory);

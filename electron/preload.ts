@@ -180,6 +180,7 @@ export interface DesktopAgentEvent {
   iteration?: number;
   toolName?: string;
   toolUseId?: string;
+  isError?: boolean;
   usage?: Record<string, unknown>;
 }
 

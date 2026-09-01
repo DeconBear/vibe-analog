@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const simulationVerifierAgent: ActoviqAgentDefinition = {
+export const simulationVerifierAgent: HadamardAgentDefinition = {
   name: 'simulation-verifier',
   description: 'Perform the final verification pass and write the acceptance report for the generated netlist.',
   systemPrompt: [

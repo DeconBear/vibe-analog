@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createHandoffSummarySkill(): ActoviqSkillDefinition {
+export function createHandoffSummarySkill(): HadamardSkillDefinition {
   return skill({
     name: 'handoff-summary',
     description: 'Read the workflow artifacts and write the final delivery summary for the job.',

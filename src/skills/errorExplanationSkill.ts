@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createErrorExplanationSkill(): ActoviqSkillDefinition {
+export function createErrorExplanationSkill(): HadamardSkillDefinition {
   return skill({
     name: 'error-explanation',
     description: 'Explain a failed workflow stage in concise Chinese for the end user.',

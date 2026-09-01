@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const librarianAgent: ActoviqAgentDefinition = {
+export const librarianAgent: HadamardAgentDefinition = {
   name: 'librarian',
   description: 'Find the best reusable templates, scripts, and repo capabilities for the requested circuit.',
   systemPrompt: [

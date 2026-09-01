@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const workflowLeadAgent: ActoviqAgentDefinition = {
+export const workflowLeadAgent: HadamardAgentDefinition = {
   name: 'workflow-lead',
   description: 'Summarize the whole circuit-design workflow and prepare the final handoff report.',
   systemPrompt: [

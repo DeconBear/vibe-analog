@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createRenderAgentSvgSkill(): ActoviqSkillDefinition {
+export function createRenderAgentSvgSkill(): HadamardSkillDefinition {
   return skill({
     name: 'render-schematic-agent-svg',
     description: 'Create scene hints, then render a custom SVG with agent-authored layout plus A* wiring.',

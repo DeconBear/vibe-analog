@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const architectAgent: ActoviqAgentDefinition = {
+export const architectAgent: HadamardAgentDefinition = {
   name: 'architect',
   description: 'Define the circuit topology, parameter budget, and verification plan before detailed netlist work.',
   systemPrompt: [

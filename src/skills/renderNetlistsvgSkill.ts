@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createRenderNetlistsvgSkill(): ActoviqSkillDefinition {
+export function createRenderNetlistsvgSkill(): HadamardSkillDefinition {
   return skill({
     name: 'render-schematic-netlistsvg',
     description: 'Generate the design JSON and render the schematic SVG through netlistsvg.',

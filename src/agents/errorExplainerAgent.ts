@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const errorExplainerAgent: ActoviqAgentDefinition = {
+export const errorExplainerAgent: HadamardAgentDefinition = {
   name: 'error-explainer',
   description: 'Explain workflow failures in user-friendly Chinese with the raw error, likely root cause, and next action.',
   systemPrompt: [

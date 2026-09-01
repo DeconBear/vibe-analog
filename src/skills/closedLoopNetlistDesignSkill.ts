@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createClosedLoopNetlistDesignSkill(): ActoviqSkillDefinition {
+export function createClosedLoopNetlistDesignSkill(): HadamardSkillDefinition {
   return skill({
     name: 'closed-loop-netlist-design',
     description: 'Use the existing ReAct loop plus repo tools to design, validate, simulate, and refine the netlist.',

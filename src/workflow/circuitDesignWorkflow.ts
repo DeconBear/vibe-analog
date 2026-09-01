@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import {
   createAgentSdk,
-  type ActoviqAgentClient,
+  type HadamardAgentClient,
   type AgentRunResult,
   type AgentSession,
 } from 'actoviq-agent-sdk';
@@ -624,7 +624,7 @@ function fallbackErrorExplanation(record: StageExecutionRecord, stage: WorkflowS
   ].join('\n');
 }
 async function explainStageError(
-  sdk: ActoviqAgentClient,
+  sdk: HadamardAgentClient,
   paths: JobPaths,
   stage: WorkflowStage,
   record: StageExecutionRecord,
@@ -818,7 +818,7 @@ function buildRetryMetadataStage(stage: WorkflowStage, repairMode: boolean): str
 }
 
 async function runStageSkillWithRetries(options: {
-  sdk: ActoviqAgentClient;
+  sdk: HadamardAgentClient;
   paths: JobPaths;
   stage: WorkflowStage;
   prompt: string;
@@ -908,7 +908,7 @@ async function runStageSkillWithRetries(options: {
 }
 
 async function executeStage(
-  sdk: ActoviqAgentClient,
+  sdk: HadamardAgentClient,
   paths: JobPaths,
   stage: WorkflowStage,
 ): Promise<StageExecutionRecord> {
@@ -955,7 +955,7 @@ async function executeStage(
 }
 
 async function repairMissingArtifacts(
-  sdk: ActoviqAgentClient,
+  sdk: HadamardAgentClient,
   paths: JobPaths,
   stage: WorkflowStage,
   record: StageExecutionRecord,

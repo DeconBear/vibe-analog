@@ -32,3 +32,6 @@ WIKI.md
 !/pdks/README.md
 repo-wiki/
 plan/
+
+# Hadamard CodeAct runtime artifact store (per-run cell audit records)
+.hadamard-artifacts/

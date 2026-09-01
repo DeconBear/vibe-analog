@@ -1,8 +1,8 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
 import { createSchematicVisionImageTool } from '../tools/renderTools.js';
 
-export function createVisionLayoutReviewSkill(): ActoviqSkillDefinition {
+export function createVisionLayoutReviewSkill(): HadamardSkillDefinition {
   return skill({
     name: 'review-schematic-layout-vision',
     description: 'Vision-only review of a rendered circuit diagram for placement and routing improvements.',

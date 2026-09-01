@@ -2,7 +2,7 @@ import { access } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 
-import { loadDefaultActoviqSettings, loadJsonConfigFile } from 'actoviq-agent-sdk';
+import { loadDefaultHadamardSettings, loadJsonConfigFile } from 'actoviq-agent-sdk';
 
 import { PROJECT_ROOT, RUNTIME_CWD, WORKSPACE_ROOT } from './projectPaths.js';
 
@@ -36,6 +36,6 @@ export async function loadActoviqConfig(): Promise<LoadedActoviqConfigSource> {
     return { source: candidate };
   }
 
-  await loadDefaultActoviqSettings();
+  await loadDefaultHadamardSettings();
   return { source: '~/.actoviq/settings.json' };
 }

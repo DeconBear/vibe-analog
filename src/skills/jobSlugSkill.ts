@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createJobSlugSkill(): ActoviqSkillDefinition {
+export function createJobSlugSkill(): HadamardSkillDefinition {
   return skill({
     name: 'generate-safe-job-slug',
     description: 'Generate a short English kebab-case slug for a workflow job or custom artifact name.',

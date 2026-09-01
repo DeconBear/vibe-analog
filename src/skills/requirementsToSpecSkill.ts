@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createRequirementsToSpecSkill(): ActoviqSkillDefinition {
+export function createRequirementsToSpecSkill(): HadamardSkillDefinition {
   return skill({
     name: 'requirements-to-spec',
     description: 'Convert natural-language requirements into a written brief plus normalized machine-usable spec files.',

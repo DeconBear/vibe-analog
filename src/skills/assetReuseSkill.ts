@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createAssetReuseSkill(): ActoviqSkillDefinition {
+export function createAssetReuseSkill(): HadamardSkillDefinition {
   return skill({
     name: 'asset-reuse-plan',
     description: 'Inspect bundled templates and helpers, choose the closest reusable template, and prepare the starting point.',

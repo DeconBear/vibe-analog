@@ -1,6 +1,6 @@
-import { skill, type ActoviqSkillDefinition } from 'actoviq-agent-sdk';
+import { skill, type HadamardSkillDefinition } from 'actoviq-agent-sdk';
 
-export function createFinalVerificationSkill(): ActoviqSkillDefinition {
+export function createFinalVerificationSkill(): HadamardSkillDefinition {
   return skill({
     name: 'final-verification-review',
     description: 'Run the final verification pass and write a file-backed acceptance review for the generated design.',

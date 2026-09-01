@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const solutionAnalystAgent: ActoviqAgentDefinition = {
+export const solutionAnalystAgent: HadamardAgentDefinition = {
   name: 'solution-analyst',
   description: 'Translate natural-language circuit requirements into a structured engineering brief and normalized spec.',
   systemPrompt: [

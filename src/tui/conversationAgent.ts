@@ -3,8 +3,8 @@ import type { Interface } from 'node:readline/promises';
 
 import {
   createAgentSdk,
-  type ActoviqAgentClient,
-  type ActoviqAgentDefinition,
+  type HadamardAgentClient,
+  type HadamardAgentDefinition,
   type AgentSession,
 } from 'actoviq-agent-sdk';
 
@@ -16,7 +16,7 @@ import { writeStdout } from '../utils/runtimeSupport.js';
 import { createConversationToolGateway } from './agentToolGateway.js';
 import { TuiStateStore } from './TuiState.js';
 
-const conversationAgent: ActoviqAgentDefinition = {
+const conversationAgent: HadamardAgentDefinition = {
   name: 'conversation-agent',
   description: 'General interactive agent that can answer questions and call workflow tools when needed.',
   systemPrompt: [
@@ -37,7 +37,7 @@ const conversationAgent: ActoviqAgentDefinition = {
 };
 
 export class TuiConversationAgent {
-  private sdk: ActoviqAgentClient | null = null;
+  private sdk: HadamardAgentClient | null = null;
   private session: AgentSession | null = null;
 
   constructor(

@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const netlistDesignerAgent: ActoviqAgentDefinition = {
+export const netlistDesignerAgent: HadamardAgentDefinition = {
   name: 'netlist-designer',
   description: 'Run the ReAct closed loop for device selection, parameter sizing, netlist editing, and simulation feedback.',
   systemPrompt: [

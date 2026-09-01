@@ -1,6 +1,6 @@
-import type { ActoviqAgentDefinition } from 'actoviq-agent-sdk';
+import type { HadamardAgentDefinition } from 'actoviq-agent-sdk';
 
-export const schemdrawRendererAgent: ActoviqAgentDefinition = {
+export const schemdrawRendererAgent: HadamardAgentDefinition = {
   name: 'schemdraw-renderer',
   description: 'Convert the final netlist into SVG using the schemdraw pipeline.',
   systemPrompt: [
