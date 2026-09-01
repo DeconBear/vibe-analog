@@ -1846,7 +1846,9 @@ export function SchematicEditor({
     const hitSelection = activeGesture
       ? null
       : contextMenuSelectionForTarget(document, draft, event.target, world);
-    const pinTarget = activeGesture ? null : pinFromPointerTarget(document, event.target);
+    const pinTarget = activeGesture
+      ? null
+      : pinFromPointerTarget(document, event.target) ?? pinFromWorld(document, world);
     // Right-clicking a member of the current multi-wire selection keeps the
     // group so the menu's Delete applies to all of them.
     const menuSelection = hitSelection?.kind === 'wire' &&
@@ -2544,6 +2546,16 @@ export function SchematicEditor({
       setSelection({ kind: 'port', id: diagnostic.port_id });
     } else if (diagnostic.wire_ids.length > 0) {
       setSelection(selectionForWireIds(diagnostic.wire_ids));
+    }
+    if (diagnostic.point) {
+      const width = Math.max(1, activeViewBox.maxX - activeViewBox.minX);
+      const height = Math.max(1, activeViewBox.maxY - activeViewBox.minY);
+      setViewport({
+        minX: diagnostic.point.x - width / 2,
+        minY: diagnostic.point.y - height / 2,
+        maxX: diagnostic.point.x + width / 2,
+        maxY: diagnostic.point.y + height / 2,
+      });
     }
     setActionNotice(diagnostic.message);
     setContextMenu(null);
@@ -4574,6 +4586,17 @@ function pinFromPointerTarget(
   if (!componentId || !pinId) return null;
   const component = document.module.components.find((candidate) => candidate.id === componentId);
   const pin = component?.pins.find((candidate) => candidate.id === pinId);
+  return component && pin ? { component, pin } : null;
+}
+
+function pinFromWorld(
+  document: ReturnType<typeof createSchematicDocument>,
+  world: CircuitPosition,
+): { component: CircuitComponent; pin: CircuitPin } | null {
+  const endpoint = hitEndpoint(document, world);
+  if (endpoint?.kind !== 'pin') return null;
+  const component = document.module.components.find((candidate) => candidate.id === endpoint.component_id);
+  const pin = component?.pins.find((candidate) => candidate.id === endpoint.pin_id);
   return component && pin ? { component, pin } : null;
 }
 
