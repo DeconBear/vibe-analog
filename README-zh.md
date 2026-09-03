@@ -97,7 +97,7 @@ npm run electron:start
 2. 用 AI 或手工完成原理图。
 3. （可选）Settings →「立创商城 (LCSC)」填 API Key/Secret；无密钥时可开 fallback 做离线演示搜料。
 4. 打开 **Export EDA** 对话框：在 **EDA Bridge** 区 Link KiCad / 嘉立创 EDA 文件夹，Push 写出、Pull 拉回（按 `stable_id`/`ACTOVIQ_ID` 对齐，不覆盖 peer 侧 PCB）。嘉立创 JSON 路径目前是实验性交换格式，尚未经过厂商应用导入验证。
-5. 在外部 EDA 继续改图 / 画板。Pull 当前只对齐已知器件的布局/属性；任意连线修改尚不能无损重建。
+5. 在外部 EDA 继续改图 / 画板。Pull 只对齐已知器件（按 `stable_id` 匹配）的布局/属性（位置、旋转、value、symbol、refdes）；peer 侧连线（wire/label）修改一律不会重建。Pull 通过与上次 Push 的连通性哈希比对检测这类修改，标记为 `connectivity_drift`（并置 `requires_review`），跳过自动落盘——请在 Actoviq 侧重做连线修改后重新 Push。
 6. 一次性 zip 导出继续用于受控交接以及 Altium-via-KiCad。
 
 **模拟 IC**：配置用户自备的 PDK/模型库与 corner，要求 MOS 明确给出 W/L/M/NF，先运行 `analog-ic-audit` 和 ngspice，再导出绑定 revision/hash 的 SPICE/CDL、映射、manifest 与 SKILL Virtuoso 包；foundry 模型只引用、不打包。Razavi-Bench 的评测材料许可证要求第三方评测套件先取得书面许可，因此当前只提供来源/revision/LICENSE 预检，题目读取与评分执行保持禁用。
@@ -208,7 +208,17 @@ TUI 中可以输入：
 
 使用 `/allow all` 可以自动通过所有阶段切换；使用 `/allow manual` 则每个阶段都需要确认。
 
-### 6. 单次任务运行
+> 内置 TUI 驱动的是旧的多阶段 workflow。对话式使用推荐下面的 `vibe-analog chat`，它运行与桌面端相同的 CodeAct 引擎。
+
+### 6. Chat 模式（CodeAct）
+
+```powershell
+vibe-analog chat
+```
+
+在终端里运行与桌面端相同的 CodeAct agent：电路、模块与产物仍然以文件形式写入 workspace。模型配置通过 `ACTOVIQ_API_KEY` / `ACTOVIQ_BASE_URL` / `ACTOVIQ_MODEL` 环境变量（例如智谱 coding plan 端点 `https://open.bigmodel.cn/api/coding/paas/v4`，模型 `glm-5.3-flash`），或通过 `--settings <path>` 传入 `agent.settings.json` 的 `env` 块。会话内命令：`/new` 新建会话，`/approval manual|execution|all` 设置审批策略，`/exit` 退出。
+
+### 7. 单次任务运行
 
 ```powershell
 vibe-analog --approval-policy execution --job-name rc-demo --requirement "Design a 1 kHz RC low-pass filter and output the netlist, simulation report, and SVG schematic."

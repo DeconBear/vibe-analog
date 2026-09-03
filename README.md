@@ -96,7 +96,7 @@ When creating a blank/demo project, choose a **project kind** (legacy projects m
 2. Finish the schematic with AI or the manual editor.
 3. Optionally configure LCSC API key/secret under Settings → 立创商城; enable fallback only for offline demo search.
 4. Open **Export EDA**: link KiCad / 嘉立创 EDA folders, then Push / Pull (identity via `stable_id` / `ACTOVIQ_ID`; peer PCB files are never overwritten). The JLCEDA JSON path is experimental and has not yet been validated by the vendor application.
-5. Continue edits / board layout in the external EDA. Pull currently reconciles known layout/property edits; arbitrary peer connectivity edits are not yet reconstructed losslessly.
+5. Continue edits / board layout in the external EDA. Pull reconciles ONLY component layout/properties (position, rotation, value, symbol, refdes) of known components matched by `stable_id`; peer connectivity edits (wires/labels) are never reconstructed. Pull detects such edits via a connectivity hash against the last push, flags them as `connectivity_drift` (with `requires_review`), and skips automatic persistence — redo connectivity changes on the Actoviq side and re-push.
 6. One-shot zip export remains available for controlled handoff and Altium-via-KiCad.
 
 For **Analog IC**, configure the user-supplied PDK/model library and corner, require explicit MOS W/L/M/NF, run `analog-ic-audit` plus ngspice, then export the revision/hash-bound SPICE/CDL + mapping + SKILL Virtuoso package. Foundry models are referenced, not bundled. Razavi-Bench evaluation remains disabled pending the written permission required by its benchmark-material license; the included command performs provenance preflight only.
@@ -211,7 +211,17 @@ Inside the TUI:
 
 Use `/allow all` for fully automatic stage transitions, or `/allow manual` to confirm every stage.
 
-### 6. One-Shot Run
+> The bundled TUI drives the legacy multi-stage workflow. For conversational work prefer `vibe-analog chat` (below), which runs the same CodeAct engine as the desktop chat.
+
+### 6. Chat Mode (CodeAct)
+
+```powershell
+vibe-analog chat
+```
+
+Runs the same desktop CodeAct agent in the terminal: circuits, modules, and artifacts are still written to the workspace as files. Configure the model via `ACTOVIQ_API_KEY` / `ACTOVIQ_BASE_URL` / `ACTOVIQ_MODEL` env vars (e.g. the Zhipu coding plan endpoint `https://open.bigmodel.cn/api/coding/paas/v4` with model `glm-5.3-flash`), or via an `agent.settings.json` `env` block passed with `--settings <path>`. Inside the chat: `/new` starts a fresh conversation, `/approval manual|execution|all` sets the approval policy, `/exit` leaves.
+
+### 7. One-Shot Run
 
 ```powershell
 vibe-analog --approval-policy execution --job-name rc-demo --requirement "Design a 1 kHz RC low-pass filter and output the netlist, simulation report, and SVG schematic."
