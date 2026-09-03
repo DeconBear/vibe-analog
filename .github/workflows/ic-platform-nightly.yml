@@ -64,3 +64,22 @@ jobs:
         with:
           name: nightly-ic-qualification
           path: output/qualification/
+
+  live-provider-smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Run live provider design smoke (GLM coding plan)
+        env:
+          ACTOVIQ_LIVE_PROVIDER: '1'
+          ACTOVIQ_LIVE_SMOKE_TIER: design
+          ACTOVIQ_API_KEY: ${{ secrets.BIGMODEL_CODING_PLAN_API_KEY }}
+          ACTOVIQ_BASE_URL: https://open.bigmodel.cn/api/coding/paas/v4
+          ACTOVIQ_MODEL: glm-5.3-flash
+        run: npm run test:live-smoke
