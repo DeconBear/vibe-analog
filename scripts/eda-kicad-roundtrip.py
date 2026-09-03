@@ -107,6 +107,24 @@ def mutate_schematic_position(schematic: Path, *, dx_mm: float, dy_mm: float, de
     schematic.write_text(updated, encoding="utf-8")
 
 
+def mutate_schematic_wire(schematic: Path, *, dx_mm: float) -> None:
+    text = schematic.read_text(encoding="utf-8")
+
+    def repl(match: re.Match[str]) -> str:
+        x = float(match.group(1)) + dx_mm
+        y = float(match.group(2))
+        return f"(wire (pts (xy {x:.4f} {y:.4f})"
+
+    updated = re.sub(
+        r"\(wire \(pts \(xy ([-\d.]+) ([-\d.]+)\)",
+        repl,
+        text,
+        count=1,
+    )
+    assert updated != text, "expected schematic wire mutation"
+    schematic.write_text(updated, encoding="utf-8")
+
+
 def main() -> int:
     temp_root = Path(tempfile.mkdtemp(prefix="actoviq-kicad-roundtrip-"))
     try:
@@ -155,11 +173,29 @@ def main() -> int:
             policy="layout_wins",
         )
         assert pull_result["ok"], pull_result
+        assert pull_result.get("connectivity_drift") is not True, (
+            "a layout-only peer edit must not be flagged as connectivity drift"
+        )
         updated = pull_result["updated_modules"]["filter"]
         r1 = next(item for item in updated["components"] if item["id"] == "r1")
         assert r1.get("stable_id") == stable_ids_before["r1"], "stable_id must be preserved"
         assert r1["position"] != positions_before["r1"], "position should reflect peer geometry edit"
         assert int(r1.get("rotation", 0)) != 0, "rotation should reflect peer geometry edit"
+
+        # A peer-side connectivity edit must be surfaced (connectivity_drift warning +
+        # review gate) instead of being silently dropped by the layout-only pull.
+        mutate_schematic_wire(schematic, dx_mm=5.08)
+        drift_pull = pull_bridge(
+            project_root,
+            "kicad",
+            project=project,
+            modules=modules,
+            policy="layout_wins",
+        )
+        assert drift_pull.get("connectivity_drift") is True, drift_pull.get("warnings")
+        assert drift_pull.get("requires_review") is True, "connectivity drift must gate automatic persistence"
+        drift_codes = {warning.get("code") for warning in drift_pull.get("warnings") or []}
+        assert "connectivity_drift" in drift_codes, drift_pull.get("warnings")
 
         print(
             json.dumps(

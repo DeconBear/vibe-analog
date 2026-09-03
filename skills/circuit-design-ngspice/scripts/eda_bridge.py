@@ -206,6 +206,57 @@ def _hash_paths(root: Path, patterns: tuple[str, ...]) -> str:
     return digest.hexdigest()
 
 
+_CONNECTIVITY_HEADS = ("wire", "label", "global_label", "hierarchical_label")
+
+
+def _sexpression_blocks(text: str, heads: tuple[str, ...]) -> list[str]:
+    positions: list[int] = []
+    for head in heads:
+        needle = f"({head}"
+        start = 0
+        while True:
+            idx = text.find(needle, start)
+            if idx < 0:
+                break
+            positions.append(idx)
+            start = idx + len(needle)
+    blocks: list[str] = []
+    for idx in sorted(set(positions)):
+        depth = 0
+        end = idx
+        while end < len(text):
+            char = text[end]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        blocks.append(" ".join(text[idx:end].split()))
+    return sorted(blocks)
+
+
+def _wire_graph_hash(root: Path) -> str:
+    """Order-insensitive hash of connectivity-bearing s-expressions in peer schematics.
+
+    Component positions move freely without changing this hash; editing, adding,
+    or removing wires/labels does.
+    """
+    digest = hashlib.sha256()
+    if not root.is_dir():
+        return digest.hexdigest()
+    for path in sorted(root.glob("*.kicad_sch")):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for block in _sexpression_blocks(text, _CONNECTIVITY_HEADS):
+            digest.update(block.encode("utf-8"))
+            digest.update(b"\x00")
+    return digest.hexdigest()
+
+
 def _push_kicad(
     peer_root: Path,
     project: dict[str, Any],
@@ -271,6 +322,7 @@ def push_bridge(
 
     if peer_kind == "kicad":
         content_hash, id_map, files = _push_kicad(peer_root, project, modules, document_hash=document_hash)
+        manifest["last_push_wire_hash"] = _wire_graph_hash(peer_sync_root(peer_root) / "kicad")
     elif peer_kind == "jlceda":
         content_hash, id_map, files = _push_jlceda(peer_root, project, modules, document_hash=document_hash)
     else:
@@ -336,10 +388,31 @@ def pull_bridge(
             "updated_modules": {},
         }
 
+    connectivity_drift = False
+    if peer_kind == "kicad":
+        pushed_wire_hash = str(manifest.get("last_push_wire_hash") or "")
+        peer_wire_hash = _wire_graph_hash(peer_sync_root(peer_root) / "kicad")
+        if pushed_wire_hash and peer_wire_hash and peer_wire_hash != pushed_wire_hash:
+            connectivity_drift = True
+            warnings = list(result.get("warnings") or [])
+            warnings.append(
+                {
+                    "code": "connectivity_drift",
+                    "message": (
+                        "Peer schematic connectivity changed since the last push. "
+                        "Pull reconciles only component layout/properties of known components; "
+                        "connectivity edits made in the peer are NOT reconstructed."
+                    ),
+                }
+            )
+            result["warnings"] = warnings
+            result["requires_review"] = True
+
     return {
         **result,
         "peer_kind": peer_kind,
         "peer_root": str(peer_root),
         "policy": effective_policy,
         "last_pull_hash": content_hash,
+        "connectivity_drift": connectivity_drift,
     }
