@@ -566,6 +566,27 @@ test('parseCliOptions reports missing values and invalid policies', () => {
   assert.equal(parseCliOptions(['--rerun-from-stage']).error, 'missing value for --rerun-from-stage');
 });
 
+test('parseCliOptions parses chat mode and rejects workflow flags', () => {
+  const chat = parseCliOptions(['chat', '--settings', 'agent.settings.json', '--approval-policy', 'all']);
+  assert.equal(chat.chatMode, true);
+  assert.equal(chat.settingsPath, 'agent.settings.json');
+  assert.equal(chat.approvalPolicy, 'all');
+  assert.equal(chat.error, undefined);
+
+  const plain = parseCliOptions([]);
+  assert.equal(plain.chatMode, false);
+
+  assert.equal(
+    parseCliOptions(['chat', '--resume-job', 'some-job']).error,
+    '--resume-job is not available in chat mode',
+  );
+  assert.equal(
+    parseCliOptions(['chat', '--auto-approve']).error,
+    '--auto-approve is not available in chat mode',
+  );
+  assert.equal(parseCliOptions(['--resume-job', 'some-job']).chatMode, false);
+});
+
 test('parseTuiCommand distinguishes chat text from slash commands', () => {
   assert.equal(parseTuiCommand('设计一个 LDO'), null);
   assert.deepEqual(parseTuiCommand('/allow all'), {

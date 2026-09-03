@@ -37,6 +37,8 @@ interface CliOptions {
   legacyCli: boolean;
   showHelp: boolean;
   showVersion: boolean;
+  chatMode: boolean;
+  settingsPath?: string;
   error?: string;
 }
 
@@ -52,6 +54,12 @@ function printHelp(): void {
       '',
       'Usage:',
       '  vibe-analog [options]',
+      '  vibe-analog chat [--settings <path>] [--approval-policy <mode>]',
+      '',
+      'Modes:',
+      '  chat                   Conversational CodeAct agent (same engine as the desktop chat).',
+      '                         Config via ACTOVIQ_API_KEY / ACTOVIQ_BASE_URL / ACTOVIQ_MODEL',
+      '                         env vars or an agent.settings.json "env" block (--settings).',
       '',
       'Options:',
       '  --requirement <text>   Start the workflow with a requirement string.',
@@ -100,7 +108,8 @@ type ValueCliKey =
   | 'resumeJob'
   | 'revisionBaseJob'
   | 'jobParentDir'
-  | 'rerunFromStage';
+  | 'rerunFromStage'
+  | 'settingsPath';
 
 const BOOLEAN_FLAGS: Record<string, BooleanCliKey> = {
   '--auto-approve': 'autoApprove',
@@ -121,6 +130,7 @@ const VALUE_FLAGS: Record<string, ValueCliKey> = {
   '--revision-base-job': 'revisionBaseJob',
   '--job-parent-dir': 'jobParentDir',
   '--rerun-from-stage': 'rerunFromStage',
+  '--settings': 'settingsPath',
 };
 
 function readFlagValue(argv: string[], index: number, arg: string): { value?: string; error?: string } {
@@ -137,12 +147,32 @@ export function parseCliOptions(argv: string[]): CliOptions {
     legacyCli: false,
     showHelp: false,
     showVersion: false,
+    chatMode: false,
   };
+
+  if (argv[0] === 'chat') {
+    options.chatMode = true;
+    argv = argv.slice(1);
+  }
+
+  const WORKFLOW_ONLY_VALUE_KEYS: ReadonlySet<ValueCliKey> = new Set([
+    'requirement',
+    'requirementFile',
+    'jobName',
+    'resumeJob',
+    'revisionBaseJob',
+    'jobParentDir',
+    'rerunFromStage',
+  ]);
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     const booleanKey = BOOLEAN_FLAGS[arg];
     if (booleanKey) {
+      if (options.chatMode && (booleanKey === 'autoApprove' || booleanKey === 'legacyCli')) {
+        options.error = `${arg} is not available in chat mode`;
+        break;
+      }
       options[booleanKey] = true;
       continue;
     }
@@ -164,6 +194,10 @@ export function parseCliOptions(argv: string[]): CliOptions {
 
     const valueKey = VALUE_FLAGS[arg];
     if (valueKey) {
+      if (options.chatMode && WORKFLOW_ONLY_VALUE_KEYS.has(valueKey)) {
+        options.error = `${arg} is not available in chat mode`;
+        break;
+      }
       const { value, error } = readFlagValue(argv, index, arg);
       if (error || value === undefined) {
         options.error = error;
@@ -263,6 +297,15 @@ export async function main(): Promise<void> {
     return;
   }
 
+  if (options.chatMode) {
+    const { startChatMode } = await import('./chat/chatMode.js');
+    await startChatMode({
+      settingsPath: options.settingsPath,
+      approvalPolicy: options.approvalPolicy,
+    });
+    return;
+  }
+
   if (options.configPath?.trim()) {
     process.env.ACTOVIQ_AGENT_CONFIG_PATH = path.resolve(options.configPath.trim());
   }
@@ -312,6 +355,9 @@ export async function main(): Promise<void> {
 
   writeStdout(`vibe-analog v${packageVersion}\n`);
   writeStdout(`workspace: ${WORKSPACE_ROOT}\n`);
+  writeStdout(
+    'notice: this TUI drives the legacy multi-stage workflow. For the conversational CodeAct agent use `vibe-analog chat`.\n',
+  );
   checkNgspice();
   if (!options.legacyCli && !options.requirement && !options.requirementFile && !options.resumeJob && !options.revisionBaseJob) {
     await startTuiApp();
