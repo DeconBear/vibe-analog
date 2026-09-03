@@ -64,3 +64,18 @@
 5. `tools: []`、`inheritDefaultTools: false` 及两者组合的工具目录快照测试。
 6. provider 401 响应正文回显密钥时，agent-executions 落盘文件不得包含该密钥。
 7. 无 approver 的 `permissionMode: 'default'` + `agentMode: 'codeact'` 组合下，CodeCell 能执行（或给出可操作的配置错误）。
+
+## 升级验收（必跑）
+
+每次升级 `actoviq-agent-sdk` 后，先运行：
+
+```bash
+npm run test:sdk-upstream
+```
+
+该脚本（`scripts/sdk-upstream-acceptance.ts`）对上文 Issue 1 / 2 / 6 / 7 做行为或源码探针：
+
+- 全部 `OK`（exit 0）：本文档记载的绕过方案在该 SDK 版本上仍然必要且有效。
+- 任一 `CHANGED`（exit 1）：对应缺陷在上游已修复或行为变化，必须重新验证
+  项目侧绕过（`openAiVisionModelApi`、`sanitizedModelApi`、`createAgentSdk`
+  权限白名单等）后再决定移除或保留，并同步更新本文档。
