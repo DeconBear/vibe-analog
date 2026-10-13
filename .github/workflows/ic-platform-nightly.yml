@@ -2,6 +2,11 @@ name: IC platform nightly qualification
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/ic-platform-nightly.yml'
+      - '.github/ic-qualification-lock.json'
+      - 'scripts/pdk-checkout-regression.py'
   schedule:
     - cron: '23 19 * * 1'
 
@@ -33,6 +38,7 @@ jobs:
       - run: npm ci
       - run: npm run test:ic-platform
       - run: npm run test:ic-qualification-contract
+      - run: python scripts/pdk-checkout-regression.py
       - name: Checkout locked PDK source revisions
         shell: bash
         run: |
@@ -47,7 +53,13 @@ jobs:
               subprocess.run(["git", "-C", str(target), "remote", "add", "origin", item["repository"]], check=True)
               subprocess.run(["git", "-C", str(target), "fetch", "--depth", "1", "origin", item["revision"]], check=True)
               subprocess.run(["git", "-C", str(target), "checkout", "--detach", "FETCH_HEAD"], check=True)
-              subprocess.run(["git", "-C", str(target), "submodule", "update", "--init", "--recursive"], check=True)
+              # Old SKY130 revisions contain public GitHub submodules with SSH URLs.
+              # Command-scoped config is inherited by recursive Git children; no SSH key
+              # or persistent runner/user Git configuration is required.
+              subprocess.run([
+                  "git", "-c", "url.https://github.com/.insteadOf=git+ssh://github.com/",
+                  "-C", str(target), "submodule", "update", "--init", "--recursive",
+              ], check=True)
           PY
       - name: Scan locked PDKs without registering or copying content
         shell: bash
